@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  php2shell-audit.sh  ·  v1.4 (IoC-Stand 23.10.2026)
+#  php2shell-audit.sh  ·  v1.6 (IoC-Stand 23.10.2026)
 #
 #  PHP2Shell (CVE-2026-109618 / CVE-2026-109619)
 #  Verwundbarkeits- und Kompromittierungs-Check für Laravel-Forge-Server
@@ -114,7 +114,7 @@ ok()   { [ "$QUIET" = 1 ] || printf '  %s[OK]%s %s\n'   "$G" "$N" "$*"; }
 info() { [ "$QUIET" = 1 ] || printf '  %s[INFO]%s %s\n' "$B" "$N" "$*"; }
 sect() { printf '\n%s==== %s ====%s\n' "$C" "$*" "$N"; }
 sub()  { printf '\n %s--- %s ---%s\n' "$C" "$*" "$N"; }
-det()  { cut -c1-240 | awk -v m="$MAXLIST" 'NF{n++; if(n<=m) print "        " $0}
+det()  { cut -c1-320 | awk -v m="$MAXLIST" 'NF{n++; if(n<=m) print "        " $0}
          END{if(n>m) print "        … (+" n-m " weitere – MAXLIST=1000 für alle)"}'; }
 cnt()  { [ -z "$1" ] && echo 0 || printf '%s\n' "$1" | grep -c .; }
 in_since() { [ -n "$1" ] && [ "$1" -ge "$SINCE_EPOCH" ]; }
@@ -369,6 +369,16 @@ info "Prüfzeitraum ab $SINCE · Report: $REPORT"
 info "Hinweis: rein lesend. Fehlende Treffer sind kein Beweis – Request-Bodies werden i. d. R. nicht geloggt."
 
 # ============================================================================
+pool_eff() { # $1 Pool-Datei  $2 Key-Regex  $3 ini-Wert → "wert|quelle" (admin|pool|ini)
+  local a p
+  a=$(grep -hE "^\s*php_admin_(value|flag)\[$2\]" "$1" | tail -1 | sed -E 's/^[^=]*=\s*//; s/\s*;.*$//; s/\s+$//; s/^"(.*)"$/\1/')
+  [ -n "$a" ] && { echo "$a|admin"; return; }
+  p=$(grep -hE "^\s*php_(value|flag)\[$2\]" "$1" | tail -1 | sed -E 's/^[^=]*=\s*//; s/\s*;.*$//; s/\s+$//; s/^"(.*)"$/\1/')
+  [ -n "$p" ] && { echo "$p|pool"; return; }
+  echo "$3|ini"
+}
+as_bool() { case "${1,,}" in 1|on|true|yes) echo 1;; ""|0|off|false|no|none) echo 0;; *) echo "?";; esac; }
+USER_INIS=$(find /home -xdev -maxdepth 6 \( -name vendor -o -name node_modules -o -name .git \) -prune -o -type f -name '.user.ini' -print 2>/dev/null)
 sect "1 · Verwundbarkeit (PHP-Versionen, laufende Prozesse, Mitigations)"
 CUR="PHP"
 mapfile -t PHPVERS < <(ls -1 /usr/bin/php[0-9]*.[0-9]* /usr/sbin/php-fpm[0-9]*.[0-9]* 2>/dev/null | grep -oE '[0-9]+\.[0-9]+$' | sort -uV)
@@ -385,9 +395,8 @@ for v in "${PHPVERS[@]}"; do
   info "CLI: ${cli:-–} · FPM: ${fpm:-nicht installiert}"
   fixed="${FIXED[$v]:-}"
   backport=0
-  for cl in /usr/share/doc/php$v-fpm/changelog.Debian.gz /usr/share/doc/php$v-common/changelog.Debian.gz; do
-    [ -f "$cl" ] && zgrep -qE 'CVE-2026-10961[89]' "$cl" 2>/dev/null && backport=1
-  done
+  [ "$(zcat -f /usr/share/doc/php$v-fpm/changelog.Debian.gz /usr/share/doc/php$v-common/changelog.Debian.gz 2>/dev/null \
+       | grep -oE 'CVE-2026-10961[89]' | sort -u | wc -l)" -eq 2 ] && backport=1
   served="${fpm:-$cli}"; isvuln=0
   if [ -z "$served" ]; then info "Version nicht ermittelbar"
   elif [ -z "$fixed" ]; then
@@ -409,36 +418,66 @@ for v in "${PHPVERS[@]}"; do
     else ok "FPM-Master PID $pid läuft mit aktueller Binary (Start: $started)"; fi
   done
 
-  # Mitigations / ini (nur Info, da Patch maßgeblich)
-  if [ -f "/etc/php/$v/fpm/php.ini" ] && [ -x "/usr/bin/php$v" ]; then
-    iniget() { PHP_INI_SCAN_DIR="/etc/php/$v/fpm/conf.d" "/usr/bin/php$v" -c "/etc/php/$v/fpm/php.ini" "${PHPINI[@]}" \
-               -r "\$x=ini_get('$1'); echo \$x===false?'n/a':(\$x===''?'leer':\$x);" 2>/dev/null; }
-    upe=$(iniget session.upload_progress.enabled); ml=$(iniget memory_limit); feb=$(iniget fatal_error_backtraces)
-    sp=$(iniget session.save_path); el=$(iniget error_log)
-    case "$upe" in leer|0) upe="0 (aus – Mitigation aktiv)";; 1) upe="1 (an)";; esac
-    info "FPM-ini: session.upload_progress.enabled=${upe} · memory_limit=${ml} · fatal_error_backtraces=${feb}"
+  # Mitigation: effektive Werte JE POOL (php_admin_* erzwingt > php_value/flag > php.ini/conf.d),
+  # .user.ini-Overrides, ob die Konfiguration geladen ist, RLIMIT vs. cgroup
+  FPMB="/usr/sbin/php-fpm$v"
+  if [ -x "$FPMB" ] && [ -d "/etc/php/$v/fpm/pool.d" ]; then
+    fpmi() { "$FPMB" -i 2>/dev/null | awk -F' => ' -v k="$1" '$1==k{print ($2=="no value")?"":$2; exit}'; }
+    i_upe=$(fpmi session.upload_progress.enabled); i_ml=$(fpmi memory_limit); i_feb=$(fpmi fatal_error_backtraces)
+    sp=$(fpmi session.save_path); el=$(fpmi error_log)
+    info "FPM-ini (php.ini + conf.d): session.upload_progress.enabled=${i_upe:-?} · memory_limit=${i_ml:-?}$([ "$v" = 8.5 ] && echo " · fatal_error_backtraces=${i_feb:-?}")"
+    gaps=""; pools=""; all_ml_admin=1; all_up_admin=1; all_fb_admin=1
+    for pf in /etc/php/$v/fpm/pool.d/*.conf; do
+      [ -f "$pf" ] || continue; pn=$(basename "$pf" .conf)
+      IFS='|' read -r ml_v ml_s < <(pool_eff "$pf" 'memory_limit' "$i_ml")
+      IFS='|' read -r up_v up_s < <(pool_eff "$pf" 'session\.upload_progress\.enabled' "$i_upe")
+      IFS='|' read -r fb_v fb_s < <(pool_eff "$pf" 'fatal_error_backtraces' "$i_feb")
+      up_b=$(as_bool "$up_v"); fb_b=$(as_bool "$fb_v")
+      [ "$ml_s" = admin ] || all_ml_admin=0; [ "$up_s" = admin ] || all_up_admin=0; [ "$fb_s" = admin ] || all_fb_admin=0
+      pools+="$pn: memory_limit=${ml_v:-?} ($ml_s) · upload_progress=$up_b ($up_s)$([ "$v" = 8.5 ] && echo " · fatal_error_backtraces=$fb_b ($fb_s)")"$'\n'
+      if [ "$isvuln" = 1 ]; then
+        if [ "$ml_v" != "-1" ]; then gaps+="$pn: memory_limit=${ml_v:-?} statt -1 · "
+        elif [ "$ml_s" != admin ]; then gaps+="$pn: memory_limit=-1 nicht erzwungen (php_admin_value fehlt) · "; fi
+        [ "$up_b" = 0 ] || gaps+="$pn: upload_progress an · "
+        if [ "$v" = 8.5 ] && [ "$fb_b" != 0 ]; then gaps+="$pn: fatal_error_backtraces an · "; fi
+      fi
+    done
+    [ -n "$pools" ] && { info "Effektive Werte je Pool (admin = erzwungen):"; printf '%s' "$pools" | det; }
     if [ "$isvuln" = 1 ]; then
-      gaps=""
-      # effektives memory_limit je Pool (php_admin_value erzwingt, sonst php.ini/conf.d)
-      mlbad=""
-      for pf in /etc/php/$v/fpm/pool.d/*.conf; do
-        [ -f "$pf" ] || continue
-        pv=$(grep -hE '^\s*php_admin_value\[memory_limit\]' "$pf" | tail -1 | sed -E 's/^[^=]*=\s*//; s/\s*;.*$//; s/\s+$//')
-        [ "${pv:-$ml}" = "-1" ] || mlbad+="$(basename "$pf" .conf)=${pv:-$ml} "
+      # .user.ini im Webroot kann nicht erzwungene Werte überschreiben (memory_limit: INI_ALL, upload_progress: INI_PERDIR)
+      for ui in $USER_INIS; do
+        grep -qiE '^\s*memory_limit\s*=' "$ui" && [ "$all_ml_admin" = 0 ] && gaps+="$ui setzt memory_limit · "
+        grep -qiE '^\s*session\.upload_progress\.enabled\s*=\s*"?(1|on|true|yes)' "$ui" && [ "$all_up_admin" = 0 ] && gaps+="$ui schaltet upload_progress ein · "
+        if [ "$v" = 8.5 ] && grep -qiE '^\s*fatal_error_backtraces\s*=\s*"?(1|on|true|yes)' "$ui" && [ "$all_fb_admin" = 0 ]; then gaps+="$ui schaltet fatal_error_backtraces ein · "; fi
       done
-      [ -n "$mlbad" ] && gaps+="CVE-2026-109618 offen (memory_limit≠-1: ${mlbad% }) · "
-      [[ "$upe" == 1* ]] && gaps+="CVE-2026-109619 offen (upload_progress an) · "
-      [ "$v" = 8.5 ] && [ "$feb" = 1 ] && gaps+="CVE-2026-109619 (8.5-Backtrace-Pfad) offen (fatal_error_backtraces=1) · "
-      [ -n "$gaps" ] && vuln "Mitigation unvollständig: ${gaps% · }"
+      # Geladen? Konfiguration jünger als die ältesten laufenden FPM-Prozesse → Reload fehlt
+      cfg_ts=$(stat -L -c %Z /etc/php/$v/fpm/php.ini /etc/php/$v/fpm/php-fpm.conf /etc/php/$v/fpm/conf.d/*.ini /etc/php/$v/fpm/pool.d/*.conf 2>/dev/null | sort -n | tail -1)
+      now=$(date +%s); run_ts=""
+      for pid in $(pgrep -f "php-fpm: master process \(/etc/php/$v/" 2>/dev/null); do
+        w=$(ps -o etimes= --ppid "$pid" 2>/dev/null | sort -n | tail -1 | tr -d ' ')
+        [ -z "$w" ] && w=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')
+        [ -n "$w" ] && t=$(( now - w )) && { [ -z "$run_ts" ] || [ "$t" -lt "$run_ts" ]; } && run_ts=$t
+      done
+      if [ -n "$run_ts" ] && [ -n "$cfg_ts" ] && [ "$run_ts" -lt "$cfg_ts" ]; then
+        gaps+="Konfiguration geändert ($(date -d "@$cfg_ts" '+%F %T')), laufende FPM-Prozesse älter → 'systemctl reload php$v-fpm' (bei pm=ondemand ohne Traffic ggf. Fehlalarm) · "
+      fi
+      # cgroup-Deckel (empfohlen) vs. RLIMIT (laut Advisory ungeeignet)
+      if [ -d /run/systemd/system ] && systemctl cat "php$v-fpm.service" >/dev/null 2>&1; then
+        cap=$(systemctl show -p MemoryMax --value "php$v-fpm.service" 2>/dev/null); [ "$cap" = infinity ] || [ -z "$cap" ] && cap=$(systemctl show -p MemoryLimit --value "php$v-fpm.service" 2>/dev/null)
+        if [[ "$cap" =~ ^[0-9]+$ ]]; then info "cgroup-Speicherdeckel für php$v-fpm: $(( cap / 1048576 ))M"
+        else info "kein cgroup-Speicherdeckel für php$v-fpm (empfohlen bei memory_limit=-1)"; fi
+        rl=$(systemctl show -p LimitAS -p LimitDATA "php$v-fpm.service" 2>/dev/null | grep -v '=infinity$')
+        [ -n "$rl" ] && gaps+="RLIMIT gesetzt ($(echo $rl)) – laut Advisory ungeeignet, cgroup-Limit verwenden · "
+      fi
+      if [ -n "$gaps" ]; then vuln "Mitigation unvollständig:"; printf '%s\n' "${gaps% · }" | sed 's/ · /\n/g' | det
+      else ok "Übergangs-Mitigation vollständig und geladen (memory_limit=-1 erzwungen, upload_progress aus$([ "$v" = 8.5 ] && echo ', fatal_error_backtraces aus') in allen Pools) – ersetzt keinen Patch"; fi
     fi
-    [ -n "$sp" ] && [ "$sp" != leer ] && [ "$sp" != n/a ] && SESS_PATHS+=("${sp##*;}")
-    [ -n "$el" ] && [ "$el" != leer ] && [ "$el" != n/a ] && [ "$el" != syslog ] && PHP_ERRLOGS+=("$el")
+    [ -n "$sp" ] && SESS_PATHS+=("${sp##*;}")
+    [ -n "$el" ] && [ "$el" != syslog ] && PHP_ERRLOGS+=("$el")
   fi
   ap=$(grep -hsE '^\s*auto_(prepend|append)_file\s*=\s*\S' /etc/php/$v/fpm/php.ini /etc/php/$v/fpm/conf.d/*.ini 2>/dev/null)
   ap+=$(grep -hsE 'php_(admin_)?value\[auto_(prepend|append)_file\]\s*=\s*\S' /etc/php/$v/fpm/pool.d/*.conf 2>/dev/null)
   [ -n "$ap" ] && { rev "auto_prepend/append_file in FPM-Konfiguration gesetzt:"; printf '%s\n' "$ap" | det; }
-  ov=$(grep -HsE '^\s*php_(admin_)?(value|flag)\[(session\.upload_progress\.enabled|memory_limit|fatal_error_backtraces)\]' /etc/php/$v/fpm/pool.d/*.conf 2>/dev/null)
-  [ -n "$ov" ] && { info "Pool-Overrides:"; printf '%s\n' "$ov" | det; }
 done
 
 # FrankenPHP (Octane) bringt eigenes PHP mit – nur als Owner ausführen
@@ -742,8 +781,8 @@ CUR="System"
 if [ -s /etc/ld.so.preload ]; then crit "/etc/ld.so.preload ist gesetzt (Rootkit-Technik):"; det < /etc/ld.so.preload; else ok "/etc/ld.so.preload leer/nicht vorhanden"; fi
 x=$(awk -F: '$3==0 && $1!="root"{print $1}' /etc/passwd)
 [ -n "$x" ] && { crit "weitere Accounts mit UID 0:"; printf '%s\n' "$x" | det; }
-find /etc/passwd /etc/shadow /etc/group /etc/gshadow /etc/sudoers /etc/sudoers.d -type f -newerct "$SINCE" 2>/dev/null | not_pkg_clean \
-  | report_changed "Account-/sudo-Dateien seit $SINCE geändert (Forge legt z. B. isolierte User an)"
+report_changed "Account-/sudo-Dateien seit $SINCE geändert (Forge legt z. B. isolierte User an)" \
+  < <(find /etc/passwd /etc/shadow /etc/group /etc/gshadow /etc/sudoers /etc/sudoers.d -type f -newerct "$SINCE" 2>/dev/null | not_pkg_clean)
 
 x=""
 for f in /root/.ssh/authorized_keys* /home/*/.ssh/authorized_keys*; do
@@ -751,18 +790,18 @@ for f in /root/.ssh/authorized_keys* /home/*/.ssh/authorized_keys*; do
   c=$(stat -c %Z -- "$f")
   in_since "$c" && x+="$f ($(grep -cvE '^\s*(#|$)' "$f") Keys: $(awk '!/^\s*#/ && NF{print $NF}' "$f" | tr '\n' ' '))"$'\n'
 done
-if [ -n "$x" ]; then printf '%s' "$x" | report_changed "authorized_keys seit $SINCE geändert – Keys abgleichen"
+if [ -n "$x" ]; then report_changed "authorized_keys seit $SINCE geändert – Keys abgleichen" <<< "$x"
 else ok "authorized_keys seit $SINCE unverändert"; fi
 
 CRONF=(/etc/crontab /etc/anacrontab /etc/cron.d/* /etc/cron.hourly/* /etc/cron.daily/* /etc/cron.weekly/* /etc/cron.monthly/* /var/spool/cron/crontabs/*)
-find "${CRONF[@]}" -maxdepth 0 -type f -newerct "$SINCE" 2>/dev/null | not_pkg_clean | report_changed "Cron-Dateien seit $SINCE geändert"
+report_changed "Cron-Dateien seit $SINCE geändert" < <(find "${CRONF[@]}" -maxdepth 0 -type f -newerct "$SINCE" 2>/dev/null | not_pkg_clean)
 x=$(grep -HnaE '(curl|wget)[^|;#]*\|\s*(ba|z|da)?sh|base64\s+(-d|--decode)|/(tmp|dev/shm|var/tmp)/|bash\s+-i|\bnc(at)?\b.*\s-e\s|python[0-9.]*\s+-c|perl\s+-e|/storage/[^ ]*\.(sh|bin|elf)' "${CRONF[@]}" 2>/dev/null | grep -avE ':[0-9]+:\s*#')
 [ -n "$x" ] && { crit "verdächtige Cron-Einträge:"; printf '%s\n' "$x" | det; } || ok "keine verdächtigen Cron-Einträge"
 ls /var/spool/cron/atjobs/* >/dev/null 2>&1 && rev "at-Jobs vorhanden: $(ls /var/spool/cron/atjobs | tr '\n' ' ')"
 
 x=$(find /etc/systemd/system /root/.config/systemd /home/*/.config/systemd -type f -newerct "$SINCE" ! -name 'snap-*.mount' ! -name 'snap.*' 2>/dev/null)
 x+=$'\n'$(find /lib/systemd/system /usr/lib/systemd/system -type f -newerct "$SINCE" -print0 2>/dev/null | xargs -0 -r readlink -f | sort -u | while IFS= read -r f; do pkg_owner "$f" >/dev/null || echo "$f (keinem Paket zugeordnet)"; done)
-printf '%s\n' "$x" | report_changed "systemd-Units seit $SINCE neu/geändert"
+report_changed "systemd-Units seit $SINCE neu/geändert" <<< "$x"
 x=$(grep -rlaE '^\s*Exec(Start|StartPre|StartPost|Reload)\s*=.*(/tmp/|/dev/shm/|/var/tmp/|/storage/)' /etc/systemd /lib/systemd/system /usr/lib/systemd/system /home/*/.config/systemd /root/.config/systemd 2>/dev/null \
     | xargs -r -d '\n' readlink -f | sort -u | not_pkg_clean)
 [ -n "$x" ] && { crit "systemd-Units starten Programme aus Temp-/Storage-Verzeichnissen:"; printf '%s\n' "$x" | det; }
@@ -770,7 +809,7 @@ x=$(find /etc/supervisor -type f -newerct "$SINCE" 2>/dev/null)
 [ -n "$x" ] && { info "Supervisor-Configs geändert (Forge-Daemons/Queues – abgleichen):"; printf '%s\n' "$x" | det; }
 
 RCF=(/etc/profile /etc/bash.bashrc /etc/environment /etc/profile.d/* /root/.bashrc /root/.profile /root/.bash_profile /home/*/.bashrc /home/*/.profile /home/*/.bash_profile /home/*/.bash_login /home/*/.zshrc)
-find "${RCF[@]}" -maxdepth 0 -type f -newerct "$SINCE" 2>/dev/null | not_pkg_clean | report_changed "Shell-Startdateien seit $SINCE geändert"
+report_changed "Shell-Startdateien seit $SINCE geändert" < <(find "${RCF[@]}" -maxdepth 0 -type f -newerct "$SINCE" 2>/dev/null | not_pkg_clean)
 x=$(grep -HnaE 'LD_PRELOAD|(curl|wget)[^|]*\|\s*(ba)?sh|/dev/(tcp|udp)/|base64\s+(-d|--decode)|/(tmp|dev/shm)/[^ ]*\s*&' "${RCF[@]}" 2>/dev/null)
 [ -n "$x" ] && { crit "verdächtige Einträge in Shell-Startdateien:"; printf '%s\n' "$x" | det; }
 
@@ -797,7 +836,7 @@ if [ -n "$pk" ]; then
     [ -n "$xbn" ] && { crit "System-Binaries/Libraries im Prüfzeitraum verändert (Manipulation?):"; printf '%s' "$xbn" | det; }
     [ -n "$xbo" ] && { rev "System-Binaries/Libraries weichen vom Paket ab – vor dem Prüfzeitraum geändert (nicht PHP2Shell-bezogen, trotzdem klären):"; printf '%s' "$xbo" | det; }
   fi
-  [ -n "$xo" ] && printf '%s\n' "$xo" | report_changed "Paket-Konfigurationsdateien lokal angepasst (kein Binary)"
+  [ -n "$xo" ] && report_changed "Paket-Konfigurationsdateien lokal angepasst (kein Binary)" <<< "$xo"
   [ -z "$xb" ] && ok "Binaries/Libraries von PHP, Nginx, SSH, sudo, coreutils u. a. unverändert"
 fi
 
