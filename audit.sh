@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  php2shell-audit.sh  ·  v1.2 (IoC-Stand 23.10.2026)
+#  php2shell-audit.sh  ·  v1.3 (IoC-Stand 23.10.2026)
 #
 #  PHP2Shell (CVE-2026-109618 / CVE-2026-109619)
 #  Verwundbarkeits- und Kompromittierungs-Check für Laravel-Forge-Server
@@ -132,7 +132,7 @@ report_changed() { # $1 Titel; stdin: Pfade (optional " (Zusatz)")
   while IFS= read -r line; do
     [ -z "$line" ] && continue
     f="${line%% (*}"; c=$(stat -c %Z -- "$f" 2>/dev/null) || c=0
-    line="$line · $(date -d "@$c" '+%F %T')"
+    line="$(date -d "@$c" '+%F %T') · $line"
     if [ "$PROV_EPOCH" -gt 0 ] && [ "$c" -ge "$PROV_EPOCH" ] && [ "$c" -lt "$PROV_END" ]; then early+="$line"$'\n'; else late+="$line"$'\n'; fi
   done
   [ -n "$late" ]  && { rev "$title:"; printf '%s' "$late" | det; }
@@ -679,7 +679,7 @@ if [ -n "$desc" ]; then
   done <<< "$desc"
 else ok "keine Kindprozesse von PHP-FPM-Workern"; fi
 
-pc=""; pr=""; pn=""; pw=""
+pc=""; pr=""; pn=""; pw=""; pk=""
 for p in /proc/[0-9]*; do
   pid=${p##*/}
   exe=$(readlink "$p/exe" 2>/dev/null) || continue
@@ -687,6 +687,9 @@ for p in /proc/[0-9]*; do
   case "$exe" in
     /memfd:*)                              pc+="PID $pid · $usr · $comm · $exe (dateilos im RAM)"$'\n' ;;
     /tmp/*|/var/tmp/*|/dev/shm/*|/run/user/*) pc+="PID $pid · $usr · $comm · $exe"$'\n' ;;
+    "/ (deleted)")
+      if grep -q '^bpfilter ' /proc/modules 2>/dev/null; then pk+="PID $pid · $comm · bpfilter_umh (Kernel-Usermode-Helper des Moduls bpfilter)"$'\n'
+      else pc+="PID $pid · $usr · $comm · $exe (Binary gelöscht)"$'\n'; fi ;;
     *" (deleted)")
       path="${exe% (deleted)}"
       case "$path" in /usr/*|/lib/*|/lib64/*|/bin/*|/sbin/*|/opt/*|/snap/*) pr+="$comm · $path"$'\n' ;;
@@ -706,6 +709,7 @@ done
 [ -n "$pn" ] && { crit "Getarnte Prozesse (Mirai-Variante aus PHP2Shell-Kampagne):"; printf '%s' "$pn" | det; }
 [ -n "$pw" ] && { rev "Prozesse von Web-Usern mit Binary außerhalb der System-Pfade:"; printf '%s' "$pw" | det; }
 [ -z "$pc$pn$pw" ] && ok "keine verdächtigen Prozess-Binaries"
+[ -n "$pk" ] && { info "Kernel-Usermode-Helper (harmlos):"; printf '%s' "$pk" | det; }
 [ -n "$pr" ] && { info "Prozesse mit aktualisierter Binary (Neustart empfohlen):"; printf '%s' "$pr" | sort | uniq -c | det; }
 
 CUR="Netzwerk"
@@ -774,7 +778,18 @@ if [ -n "$pk" ]; then
   x=$(dpkg --verify $pk 2>/dev/null | awk '$2!="c" && $1 ~ /^..5/ {print $NF}')
   xb=$(printf '%s\n' "$x" | grep -E '^/(usr/)?(s?bin|lib(64)?|libexec)/|\.so(\.[0-9.]+)?$' | grep -vE '\.(conf|cnf|ini|rules|service|timer|socket|txt)$')
   xo=$(printf '%s\n' "$x" | grep -v '^$' | grep -vxF -f <(printf '%s\n' "$xb"))
-  [ -n "$xb" ] && { crit "System-Binaries/Libraries weichen vom Paket ab (Manipulation?):"; printf '%s\n' "$xb" | det; }
+  if [ -n "$xb" ]; then
+    xbn=""; xbo=""
+    while IFS= read -r f; do
+      [ -z "$f" ] && continue
+      c=$(stat -c %Z -- "$f" 2>/dev/null || echo 0)
+      l="$(date -d "@$c" '+%F %T') · $f (Paket $(pkg_owner "$f" || echo ?), Owner $(stat -c %U -- "$f" 2>/dev/null))"
+      [[ "$f" == /usr/lib/php/2* ]] && l+=" – PHP-Extension: per pecl überschrieben?"
+      if in_since "$c"; then xbn+="$l"$'\n'; else xbo+="$l"$'\n'; fi
+    done <<< "$xb"
+    [ -n "$xbn" ] && { crit "System-Binaries/Libraries im Prüfzeitraum verändert (Manipulation?):"; printf '%s' "$xbn" | det; }
+    [ -n "$xbo" ] && { rev "System-Binaries/Libraries weichen vom Paket ab – vor dem Prüfzeitraum geändert (nicht PHP2Shell-bezogen, trotzdem klären):"; printf '%s' "$xbo" | det; }
+  fi
   [ -n "$xo" ] && printf '%s\n' "$xo" | report_changed "Paket-Konfigurationsdateien lokal angepasst (kein Binary)"
   [ -z "$xb" ] && ok "Binaries/Libraries von PHP, Nginx, SSH, sudo, coreutils u. a. unverändert"
 fi
