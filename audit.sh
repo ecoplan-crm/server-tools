@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  php2shell-audit.sh  ·  v1.1 (IoC-Stand 23.10.2026)
+#  php2shell-audit.sh  ·  v1.2 (IoC-Stand 23.10.2026)
 #
 #  PHP2Shell (CVE-2026-109618 / CVE-2026-109619)
 #  Verwundbarkeits- und Kompromittierungs-Check für Laravel-Forge-Server
@@ -38,6 +38,15 @@ TOL_MIN="${TOL_MIN:-120}"
 MAXLIST="${MAXLIST:-15}"
 HOST="$(hostname -f 2>/dev/null || hostname)"
 REPORT="${REPORT:-/root/php2shell-audit-$(hostname -s)-$(date +%Y%m%d-%H%M%S).log}"
+PROV_EPOCH=0
+for cand in \
+  "$(head -n1 /var/log/cloud-init.log 2>/dev/null | grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8}' | xargs -r -I{} date -d '{}' +%s 2>/dev/null)" \
+  "$(stat -c %Z /etc/ssh/ssh_host_ed25519_key 2>/dev/null)"; do
+  [ -n "$cand" ] && [ "$cand" -gt 0 ] 2>/dev/null && { [ "$PROV_EPOCH" -eq 0 ] || [ "$cand" -lt "$PROV_EPOCH" ]; } && PROV_EPOCH=$cand
+done
+PROV_END=$(( PROV_EPOCH + 86400 ))
+SINCE_ADJ=0
+if [ "$PROV_EPOCH" -gt "$SINCE_EPOCH" ]; then SINCE_EPOCH=$(date -d "$(date -d "@$PROV_EPOCH" +%F)" +%s); SINCE=$(date -d "@$SINCE_EPOCH" +%F); SINCE_ADJ=1; fi
 TMPD="$(mktemp -d /root/.p2s-audit.XXXXXX)" || exit 3
 trap 'rm -rf "$TMPD"' EXIT
 TMPREF="$TMPD/ref"
@@ -118,6 +127,18 @@ pkg_owner() { local f=$1 o r
 pkg_clean() { # 0 = Datei gehört zu einem Paket und ist unverändert
   local f=$1 pkg; pkg=$(pkg_owner "$f") || return 1; [ -n "$pkg" ] || return 1
   ! dpkg --verify "$pkg" 2>/dev/null | grep -qE " (${f}|${f#/usr}|/usr${f})$"; }
+report_changed() { # $1 Titel; stdin: Pfade (optional " (Zusatz)")
+  local title=$1 line f c early="" late=""
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    f="${line%% (*}"; c=$(stat -c %Z -- "$f" 2>/dev/null) || c=0
+    line="$line · $(date -d "@$c" '+%F %T')"
+    if [ "$PROV_EPOCH" -gt 0 ] && [ "$c" -ge "$PROV_EPOCH" ] && [ "$c" -lt "$PROV_END" ]; then early+="$line"$'\n'; else late+="$line"$'\n'; fi
+  done
+  [ -n "$late" ]  && { rev "$title:"; printf '%s' "$late" | det; }
+  [ -n "$early" ] && { info "$title – während der Provisionierung:"; printf '%s' "$early" | det; }
+  return 0
+}
 not_pkg_clean() { local f; while IFS= read -r f; do [ -n "$f" ] && ! pkg_clean "$f" && echo "$f"; done; }
 ioc_hash() { local h; h=$(sha "$1"); [ -n "$h" ] && [[ "$IOC_HASHES" == *" $h"* ]]; }
 
@@ -342,6 +363,8 @@ webroot_checks() { # $1 app  $2 pub  $3 stor  $4 laravel  $5 Label
 sect "PHP2Shell-Audit · $HOST · $(date '+%F %T %Z')"
 OSNAME=$(grep -s '^PRETTY_NAME=' /etc/os-release | cut -d= -f2- | tr -d '"')
 info "System: ${OSNAME:-?} · Kernel $(uname -r) · Boot: $(uptime -s 2>/dev/null)"
+[ "$PROV_EPOCH" -gt 0 ] && info "Server provisioniert: $(date -d "@$PROV_EPOCH" '+%F %T') (Änderungen in den ersten 24 h werden als Provisionierung gewertet)"
+[ "$SINCE_ADJ" = 1 ] && info "Prüfzeitraum auf Provisionierungsdatum angepasst"
 info "Prüfzeitraum ab $SINCE · Report: $REPORT"
 info "Hinweis: rein lesend. Fehlende Treffer sind kein Beweis – Request-Bodies werden i. d. R. nicht geloggt."
 
@@ -365,16 +388,16 @@ for v in "${PHPVERS[@]}"; do
   for cl in /usr/share/doc/php$v-fpm/changelog.Debian.gz /usr/share/doc/php$v-common/changelog.Debian.gz; do
     [ -f "$cl" ] && zgrep -qE 'CVE-2026-10961[89]' "$cl" 2>/dev/null && backport=1
   done
-  served="${fpm:-$cli}"
+  served="${fpm:-$cli}"; isvuln=0
   if [ -z "$served" ]; then info "Version nicht ermittelbar"
   elif [ -z "$fixed" ]; then
     if dpkg --compare-versions "$v" lt 8.2; then
-      if [ -n "$fpm" ]; then vuln "PHP-FPM $fpm ist EOL – es gibt keinen Fix für PHP2Shell (nur Upgrade auf ≥ 8.2)"
+      if [ -n "$fpm" ]; then vuln "PHP-FPM $fpm ist EOL – es gibt keinen Fix für PHP2Shell (nur Upgrade auf ≥ 8.2)"; isvuln=1
       else info "PHP $cli (EOL) nur als CLI – nicht über Web erreichbar, trotzdem entfernen/upgraden"; fi
     else info "PHP $v: keine Referenzversion hinterlegt – manuell prüfen"; fi
   elif [ "$backport" = 1 ]; then ok "Distribution-Changelog enthält CVE-Fix (Backport)"
   elif dpkg --compare-versions "$served" lt "$fixed"; then
-    if [ -n "$fpm" ]; then vuln "PHP-FPM $fpm < $fixed"; else info "CLI $cli < $fixed (nicht über Web erreichbar, trotzdem patchen)"; fi
+    if [ -n "$fpm" ]; then vuln "PHP-FPM $fpm < $fixed"; isvuln=1; else info "CLI $cli < $fixed (nicht über Web erreichbar, trotzdem patchen)"; fi
   else ok "Version $served ≥ $fixed (gepatcht)"; fi
 
   # laufende FPM-Master: noch alte (gelöschte) Binary geladen?
@@ -394,6 +417,13 @@ for v in "${PHPVERS[@]}"; do
     sp=$(iniget session.save_path); el=$(iniget error_log)
     case "$upe" in leer|0) upe="0 (aus – Mitigation aktiv)";; 1) upe="1 (an)";; esac
     info "FPM-ini: session.upload_progress.enabled=${upe} · memory_limit=${ml} · fatal_error_backtraces=${feb}"
+    if [ "$isvuln" = 1 ]; then
+      gaps=""
+      [ "$ml" != "-1" ] && gaps+="CVE-2026-109618 offen (memory_limit≠-1) · "
+      [[ "$upe" == 1* ]] && gaps+="CVE-2026-109619 offen (upload_progress an) · "
+      [ "$v" = 8.5 ] && [ "$feb" = 1 ] && gaps+="CVE-2026-109619 (8.5-Backtrace-Pfad) offen (fatal_error_backtraces=1) · "
+      [ -n "$gaps" ] && vuln "Mitigation unvollständig: ${gaps% · }"
+    fi
     [ -n "$sp" ] && [ "$sp" != leer ] && [ "$sp" != n/a ] && SESS_PATHS+=("${sp##*;}")
     [ -n "$el" ] && [ "$el" != leer ] && [ "$el" != n/a ] && [ "$el" != syslog ] && PHP_ERRLOGS+=("$el")
   fi
@@ -446,11 +476,18 @@ resolve_root() { # Webroot → R_APP R_BASE R_ZDT R_PUB
     R_APP=$(readlink -f -- "$R_BASE"); R_PUB=$(readlink -f -- "$wr")
   fi
 }
+nginx_conf_files() { # $1 Datei → Datei + Includes (rekursiv, Tiefe 3)
+  local f=$1 depth=${2:-0} inc g
+  echo "$f"; [ "$depth" -ge 3 ] && return
+  grep -hsE '^\s*include\s+' "$f" | sed -E 's/^\s*include\s+//; s/;.*$//; s/["'\'']//g' | while IFS= read -r inc; do
+    [[ "$inc" != /* ]] && inc="/etc/nginx/$inc"
+    for g in $inc; do [ -f "$g" ] && nginx_conf_files "$g" $((depth + 1)); done
+  done
+}
 for conf in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do
   [ -f "$conf" ] || continue
   name=$(basename "$conf")
-  files=("$conf")
-  [ -d "/etc/nginx/forge-conf/$name" ] && while IFS= read -r f; do files+=("$f"); done < <(find "/etc/nginx/forge-conf/$name" -type f 2>/dev/null)
+  mapfile -t files < <( { nginx_conf_files "$conf"; [ -d "/etc/nginx/forge-conf/$name" ] && find "/etc/nginx/forge-conf/$name" -type f; } 2>/dev/null | grep -vE '/(mime\.types|fastcgi_params|fastcgi\.conf|forge_fastcgi_defaults|snippets/fastcgi-php\.conf)$' | sort -u)
   roots=$(grep -hsE '^\s*root\s+' "${files[@]}" | sed -E 's/^\s*root\s+//; s/;.*$//; s/["'\'']//g' | grep -v '\$' | sort -u)
   [ -z "$roots" ] && continue
   sock=$(grep -hsoE 'php[0-9]+\.[0-9]+-fpm[^ ;]*\.sock' "${files[@]}" | head -1)
@@ -458,6 +495,7 @@ for conf in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do
   elog=$(grep -hsE '^\s*error_log\s+' "${files[@]}" | sed -E 's/^\s*error_log\s+//; s/[ ;].*$//' | sort -u | tr '\n' ' ')
   while IFS= read -r wr; do
     [ -z "$wr" ] && continue
+    [[ "$wr" == /usr/share/nginx/* ]] && continue   # Distributions-Defaultseite
     resolve_root "$wr"
     [ -n "$R_APP" ] && [ -d "$R_APP" ] || continue
     add_site "$R_APP" "$R_BASE" "$R_ZDT" "$wr" "$R_PUB" "$conf" || continue
@@ -693,37 +731,35 @@ CUR="System"
 if [ -s /etc/ld.so.preload ]; then crit "/etc/ld.so.preload ist gesetzt (Rootkit-Technik):"; det < /etc/ld.so.preload; else ok "/etc/ld.so.preload leer/nicht vorhanden"; fi
 x=$(awk -F: '$3==0 && $1!="root"{print $1}' /etc/passwd)
 [ -n "$x" ] && { crit "weitere Accounts mit UID 0:"; printf '%s\n' "$x" | det; }
-x=$(find /etc/passwd /etc/shadow /etc/group /etc/gshadow /etc/sudoers /etc/sudoers.d -type f -newerct "$SINCE" 2>/dev/null | not_pkg_clean \
-    | while IFS= read -r f; do echo "$f (geändert $(date -d "@$(stat -c %Z -- "$f")" '+%F %T'))"; done)
-[ -n "$x" ] && { rev "Account-/sudo-Dateien seit $SINCE geändert (Forge legt z. B. isolierte User an):"; printf '%s\n' "$x" | det; }
+find /etc/passwd /etc/shadow /etc/group /etc/gshadow /etc/sudoers /etc/sudoers.d -type f -newerct "$SINCE" 2>/dev/null | not_pkg_clean \
+  | report_changed "Account-/sudo-Dateien seit $SINCE geändert (Forge legt z. B. isolierte User an)"
 
 x=""
 for f in /root/.ssh/authorized_keys* /home/*/.ssh/authorized_keys*; do
   [ -f "$f" ] || continue
   c=$(stat -c %Z -- "$f")
-  in_since "$c" && x+="$f (geändert $(date -d "@$c" +%F), $(grep -cvE '^\s*(#|$)' "$f") Keys: $(awk '!/^\s*#/ && NF{print $NF}' "$f" | tr '\n' ' '))"$'\n'
+  in_since "$c" && x+="$f ($(grep -cvE '^\s*(#|$)' "$f") Keys: $(awk '!/^\s*#/ && NF{print $NF}' "$f" | tr '\n' ' '))"$'\n'
 done
-[ -n "$x" ] && { rev "authorized_keys seit $SINCE geändert:"; printf '%s' "$x" | det; } || ok "authorized_keys seit $SINCE unverändert"
+if [ -n "$x" ]; then printf '%s' "$x" | report_changed "authorized_keys seit $SINCE geändert – Keys abgleichen"
+else ok "authorized_keys seit $SINCE unverändert"; fi
 
 CRONF=(/etc/crontab /etc/anacrontab /etc/cron.d/* /etc/cron.hourly/* /etc/cron.daily/* /etc/cron.weekly/* /etc/cron.monthly/* /var/spool/cron/crontabs/*)
-x=$(find "${CRONF[@]}" -maxdepth 0 -type f -newerct "$SINCE" 2>/dev/null | not_pkg_clean)
-[ -n "$x" ] && { rev "Cron-Dateien seit $SINCE geändert:"; printf '%s\n' "$x" | det; }
+find "${CRONF[@]}" -maxdepth 0 -type f -newerct "$SINCE" 2>/dev/null | not_pkg_clean | report_changed "Cron-Dateien seit $SINCE geändert"
 x=$(grep -HnaE '(curl|wget)[^|;#]*\|\s*(ba|z|da)?sh|base64\s+(-d|--decode)|/(tmp|dev/shm|var/tmp)/|bash\s+-i|\bnc(at)?\b.*\s-e\s|python[0-9.]*\s+-c|perl\s+-e|/storage/[^ ]*\.(sh|bin|elf)' "${CRONF[@]}" 2>/dev/null | grep -avE ':[0-9]+:\s*#')
 [ -n "$x" ] && { crit "verdächtige Cron-Einträge:"; printf '%s\n' "$x" | det; } || ok "keine verdächtigen Cron-Einträge"
 ls /var/spool/cron/atjobs/* >/dev/null 2>&1 && rev "at-Jobs vorhanden: $(ls /var/spool/cron/atjobs | tr '\n' ' ')"
 
 x=$(find /etc/systemd/system /root/.config/systemd /home/*/.config/systemd -type f -newerct "$SINCE" ! -name 'snap-*.mount' ! -name 'snap.*' 2>/dev/null)
 x+=$'\n'$(find /lib/systemd/system /usr/lib/systemd/system -type f -newerct "$SINCE" -print0 2>/dev/null | xargs -0 -r readlink -f | sort -u | while IFS= read -r f; do pkg_owner "$f" >/dev/null || echo "$f (keinem Paket zugeordnet)"; done)
-x=$(printf '%s\n' "$x" | grep -v '^$')
-[ -n "$x" ] && { rev "systemd-Units seit $SINCE neu/geändert:"; printf '%s\n' "$x" | det; }
-x=$(grep -rlaE '^\s*Exec(Start|StartPre|StartPost|Reload)\s*=.*(/tmp/|/dev/shm/|/var/tmp/|/storage/)' /etc/systemd /lib/systemd/system /home/*/.config/systemd /root/.config/systemd 2>/dev/null)
+printf '%s\n' "$x" | report_changed "systemd-Units seit $SINCE neu/geändert"
+x=$(grep -rlaE '^\s*Exec(Start|StartPre|StartPost|Reload)\s*=.*(/tmp/|/dev/shm/|/var/tmp/|/storage/)' /etc/systemd /lib/systemd/system /usr/lib/systemd/system /home/*/.config/systemd /root/.config/systemd 2>/dev/null \
+    | xargs -r -d '\n' readlink -f | sort -u | not_pkg_clean)
 [ -n "$x" ] && { crit "systemd-Units starten Programme aus Temp-/Storage-Verzeichnissen:"; printf '%s\n' "$x" | det; }
 x=$(find /etc/supervisor -type f -newerct "$SINCE" 2>/dev/null)
 [ -n "$x" ] && { info "Supervisor-Configs geändert (Forge-Daemons/Queues – abgleichen):"; printf '%s\n' "$x" | det; }
 
 RCF=(/etc/profile /etc/bash.bashrc /etc/environment /etc/profile.d/* /root/.bashrc /root/.profile /root/.bash_profile /home/*/.bashrc /home/*/.profile /home/*/.bash_profile /home/*/.bash_login /home/*/.zshrc)
-x=$(find "${RCF[@]}" -maxdepth 0 -type f -newerct "$SINCE" 2>/dev/null | not_pkg_clean)
-[ -n "$x" ] && { rev "Shell-Startdateien seit $SINCE geändert:"; printf '%s\n' "$x" | det; }
+find "${RCF[@]}" -maxdepth 0 -type f -newerct "$SINCE" 2>/dev/null | not_pkg_clean | report_changed "Shell-Startdateien seit $SINCE geändert"
 x=$(grep -HnaE 'LD_PRELOAD|(curl|wget)[^|]*\|\s*(ba)?sh|/dev/(tcp|udp)/|base64\s+(-d|--decode)|/(tmp|dev/shm)/[^ ]*\s*&' "${RCF[@]}" 2>/dev/null)
 [ -n "$x" ] && { crit "verdächtige Einträge in Shell-Startdateien:"; printf '%s\n' "$x" | det; }
 
@@ -739,7 +775,7 @@ if [ -n "$pk" ]; then
   xb=$(printf '%s\n' "$x" | grep -E '^/(usr/)?(s?bin|lib(64)?|libexec)/|\.so(\.[0-9.]+)?$' | grep -vE '\.(conf|cnf|ini|rules|service|timer|socket|txt)$')
   xo=$(printf '%s\n' "$x" | grep -v '^$' | grep -vxF -f <(printf '%s\n' "$xb"))
   [ -n "$xb" ] && { crit "System-Binaries/Libraries weichen vom Paket ab (Manipulation?):"; printf '%s\n' "$xb" | det; }
-  [ -n "$xo" ] && { rev "Paket-Konfigurationsdateien lokal angepasst (kein Binary):"; printf '%s\n' "$xo" | det; }
+  [ -n "$xo" ] && printf '%s\n' "$xo" | report_changed "Paket-Konfigurationsdateien lokal angepasst (kein Binary)"
   [ -z "$xb" ] && ok "Binaries/Libraries von PHP, Nginx, SSH, sudo, coreutils u. a. unverändert"
 fi
 
@@ -780,7 +816,7 @@ else ok "keine neuen ELF-Binaries unter /home"; fi
 # ============================================================================
 sect "7 · SSH-Logins"
 CUR="SSH"
-if ls /var/log/auth.log* >/dev/null 2>&1; then src=$(zcat -f /var/log/auth.log* 2>/dev/null); lbl="auth.log"
+if ls /var/log/auth.log* >/dev/null 2>&1; then src=$(zcat -f /var/log/auth.log* 2>/dev/null | tr -d '\000'); lbl="auth.log"
 else src=$(journalctl -q --no-pager --since "$SINCE" -t sshd -t sshd-session 2>/dev/null); lbl="journal"; fi
 FORGE_IPS=" 159.203.150.232 159.203.150.216 45.55.124.124 165.227.248.218 "
 lg=$(printf '%s\n' "$src" | grep -aoE 'Accepted [a-z-]+ for [^ ]+ from [0-9a-fA-F:.]+' | sed 's/Accepted //' | sort | uniq -c | sort -rn \
