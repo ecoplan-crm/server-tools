@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  php2shell-audit.sh  ·  v1.6 (IoC-Stand 23.10.2026)
+#  php2shell-audit.sh  ·  v1.7 (IoC-Stand 23.10.2026)
 #
 #  PHP2Shell (CVE-2026-109618 / CVE-2026-109619)
 #  Verwundbarkeits- und Kompromittierungs-Check für Laravel-Forge-Server
@@ -382,7 +382,7 @@ USER_INIS=$(find /home -xdev -maxdepth 6 \( -name vendor -o -name node_modules -
 sect "1 · Verwundbarkeit (PHP-Versionen, laufende Prozesse, Mitigations)"
 CUR="PHP"
 mapfile -t PHPVERS < <(ls -1 /usr/bin/php[0-9]*.[0-9]* /usr/sbin/php-fpm[0-9]*.[0-9]* 2>/dev/null | grep -oE '[0-9]+\.[0-9]+$' | sort -uV)
-declare -A FPM_VER=()
+declare -A FPM_VER=() MIT=()   # MIT[Version] = JA | NEIN (Grund) | nicht nötig
 SESS_PATHS=("/var/lib/php/sessions")
 PHP_ERRLOGS=()
 [ ${#PHPVERS[@]} -eq 0 ] && info "Keine System-PHP-Installation gefunden"
@@ -397,7 +397,7 @@ for v in "${PHPVERS[@]}"; do
   backport=0
   [ "$(zcat -f /usr/share/doc/php$v-fpm/changelog.Debian.gz /usr/share/doc/php$v-common/changelog.Debian.gz 2>/dev/null \
        | grep -oE 'CVE-2026-10961[89]' | sort -u | wc -l)" -eq 2 ] && backport=1
-  served="${fpm:-$cli}"; isvuln=0
+  served="${fpm:-$cli}"; isvuln=0; stale=0
   if [ -z "$served" ]; then info "Version nicht ermittelbar"
   elif [ -z "$fixed" ]; then
     if dpkg --compare-versions "$v" lt 8.2; then
@@ -414,7 +414,7 @@ for v in "${PHPVERS[@]}"; do
     exe=$(readlink "/proc/$pid/exe" 2>/dev/null)
     started=$(ps -o lstart= -p "$pid" 2>/dev/null)
     if [[ "$exe" == *"(deleted)"* ]] || grep -qE 'php.*\(deleted\)' "/proc/$pid/maps" 2>/dev/null; then
-      vuln "FPM-Master PID $pid (Start: $started) nutzt noch die alte, gelöschte Binary – 'systemctl restart php$v-fpm' nötig"
+      vuln "FPM-Master PID $pid (Start: $started) nutzt noch die alte, gelöschte Binary – 'systemctl restart php$v-fpm' nötig"; stale=1
     else ok "FPM-Master PID $pid läuft mit aktueller Binary (Start: $started)"; fi
   done
 
@@ -469,11 +469,16 @@ for v in "${PHPVERS[@]}"; do
         rl=$(systemctl show -p LimitAS -p LimitDATA "php$v-fpm.service" 2>/dev/null | grep -v '=infinity$')
         [ -n "$rl" ] && gaps+="RLIMIT gesetzt ($(echo $rl)) – laut Advisory ungeeignet, cgroup-Limit verwenden · "
       fi
-      if [ -n "$gaps" ]; then vuln "Mitigation unvollständig:"; printf '%s\n' "${gaps% · }" | sed 's/ · /\n/g' | det
-      else ok "Übergangs-Mitigation vollständig und geladen (memory_limit=-1 erzwungen, upload_progress aus$([ "$v" = 8.5 ] && echo ', fatal_error_backtraces aus') in allen Pools) – ersetzt keinen Patch"; fi
+      if [ -n "$gaps" ]; then MIT[$v]="NEIN ($(printf '%s' "${gaps% · }" | awk -F' · ' '{print NF}') Lücke(n))"; vuln "Mitigation unvollständig:"; printf '%s\n' "${gaps% · }" | sed 's/ · /\n/g' | det
+      else MIT[$v]="JA"; ok "Übergangs-Mitigation vollständig und geladen (memory_limit=-1 erzwungen, upload_progress aus$([ "$v" = 8.5 ] && echo ', fatal_error_backtraces aus') in allen Pools) – ersetzt keinen Patch"; fi
     fi
     [ -n "$sp" ] && SESS_PATHS+=("${sp##*;}")
     [ -n "$el" ] && [ "$el" != syslog ] && PHP_ERRLOGS+=("$el")
+  fi
+  if [ -n "$fpm" ]; then
+    if [ "$isvuln" = 1 ]; then [ -n "${MIT[$v]:-}" ] || MIT[$v]="NEIN (nicht prüfbar – pool.d fehlt?)"
+    elif [ "$stale" = 1 ]; then MIT[$v]="NEIN (alte Binary läuft – Neustart nötig)"
+    else MIT[$v]="nicht nötig (gepatcht)"; fi
   fi
   ap=$(grep -hsE '^\s*auto_(prepend|append)_file\s*=\s*\S' /etc/php/$v/fpm/php.ini /etc/php/$v/fpm/conf.d/*.ini 2>/dev/null)
   ap+=$(grep -hsE 'php_(admin_)?value\[auto_(prepend|append)_file\]\s*=\s*\S' /etc/php/$v/fpm/pool.d/*.conf 2>/dev/null)
@@ -492,8 +497,8 @@ if [ -n "$FP_BINS" ]; then
     pv=$(grep -oE 'PHP [0-9]+\.[0-9]+\.[0-9]+' <<< "$out" | awk '{print $2}')
     mm=$(grep -oE '^[0-9]+\.[0-9]+' <<< "$pv")
     if [ -z "$pv" ]; then rev "FrankenPHP $b: PHP-Version nicht ermittelbar"
-    elif [ -n "${FIXED[$mm]:-}" ] && dpkg --compare-versions "$pv" lt "${FIXED[$mm]}"; then vuln "FrankenPHP $b bettet PHP $pv ein (< ${FIXED[$mm]}) – Binary aktualisieren"
-    elif [ -z "${FIXED[$mm]:-}" ] && dpkg --compare-versions "$pv" lt 8.2; then vuln "FrankenPHP $b bettet EOL-PHP $pv ein"
+    elif [ -n "${FIXED[$mm]:-}" ] && dpkg --compare-versions "$pv" lt "${FIXED[$mm]}"; then vuln "FrankenPHP $b bettet PHP $pv ein (< ${FIXED[$mm]}) – Binary aktualisieren"; MIT["FrankenPHP $b"]="NEIN (von Mitigation nicht abgedeckt)"
+    elif [ -z "${FIXED[$mm]:-}" ] && dpkg --compare-versions "$pv" lt 8.2; then vuln "FrankenPHP $b bettet EOL-PHP $pv ein"; MIT["FrankenPHP $b"]="NEIN (von Mitigation nicht abgedeckt)"
     else ok "FrankenPHP $b: PHP $pv"; fi
   done <<< "$FP_BINS"
 fi
@@ -893,6 +898,18 @@ CUR=""
 sect "ZUSAMMENFASSUNG · $HOST"
 printf '  Prüfzeitraum ab %s · %d Site(s) · PHP: %s\n' "$SINCE" "${#SITES[@]}" "$(for v in "${PHPVERS[@]}"; do printf '%s ' "${FPM_VER[$v]:-$v(cli)}"; done)"
 printf '\n  %-18s %s\n' "Verwundbar:"        "$([ ${#L_VULN[@]} -gt 0 ] && echo "${R}JA (${#L_VULN[@]})${N}" || echo "${G}nein${N}")"
+MIT_NEED=0; MIT_ALL=1; MIT_DET=""
+while IFS= read -r k; do
+  [ -z "$k" ] && continue
+  case "${MIT[$k]}" in JA) MIT_NEED=1;; nicht*) ;; *) MIT_NEED=1; MIT_ALL=0;; esac
+  MIT_DET+="$([[ "$k" == FrankenPHP* ]] && echo "$k" || echo "PHP-FPM $k ($(printf '%s' "${FPM_VER[$k]:-?}"))"): ${MIT[$k]}"$'\n'
+done < <(printf '%s\n' "${!MIT[@]}" | sort -V)
+if [ ${#MIT[@]} -eq 0 ]; then MIT_TXT="– (kein PHP-FPM)"
+elif [ "$MIT_NEED" = 0 ]; then MIT_TXT="${G}nicht erforderlich (alle FPM-Versionen gepatcht)${N}"
+elif [ "$MIT_ALL" = 1 ]; then MIT_TXT="${G}JA${N} (ungepatcht, Übergangs-Mitigation vollständig und geladen)"
+else MIT_TXT="${R}NEIN${N}"; fi
+printf '  %-18s %s\n' "Vollst. Mitigation:" "$MIT_TXT"
+[ "$MIT_NEED" = 1 ] && printf '%s' "$MIT_DET" | sed 's/^/                     /'
 printf '  %-18s %s\n'   "Kritische Indizien:" "$([ ${#L_CRIT[@]} -gt 0 ] && echo "${R}${#L_CRIT[@]}${N}" || echo "${G}0${N}")"
 printf '  %-18s %s\n'   "Angriffsversuche:"   "$([ ${#L_ATT[@]} -gt 0 ] && echo "${Y}${#L_ATT[@]}${N}" || echo "${G}0${N}")"
 printf '  %-18s %s\n'   "Zu prüfen:"          "$([ ${#L_REV[@]} -gt 0 ] && echo "${Y}${#L_REV[@]}${N}" || echo "${G}0${N}")"
@@ -905,6 +922,8 @@ if [ ${#L_COV[@]} -gt 0 ];  then printf '\n  %sLOG-ABDECKUNG (Aussagekraft einge
 printf '\n  %sURTEIL:%s ' "$C" "$N"
 if [ ${#L_CRIT[@]} -gt 0 ]; then
   echo "${R}Kompromittierung möglich.${N} Server vom Netz nehmen, Logs/Report sichern, Befunde forensisch prüfen; im Zweifel neu aufsetzen und ALLE Secrets rotieren."
+elif [ ${#L_VULN[@]} -gt 0 ] && [ "$MIT_NEED" = 1 ] && [ "$MIT_ALL" = 1 ]; then
+  echo "${Y}Ungepatcht, aber Übergangs-Mitigation vollständig.${N} Patch bzw. Migration bleibt Pflicht – danach Mitigation-Recipe erneut ausführen (nimmt memory_limit=-1 zurück)."
 elif [ ${#L_VULN[@]} -gt 0 ]; then
   echo "${R}Server verwundbar.${N} Sofort patchen bzw. PHP-FPM neu starten, danach Skript erneut ausführen."
 elif [ ${#L_ATT[@]} -gt 0 ]; then
