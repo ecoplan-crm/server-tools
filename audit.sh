@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  php2shell-audit.sh  ·  v1.0 (IoC-Stand 23.10.2026)
+#  php2shell-audit.sh  ·  v1.1 (IoC-Stand 23.10.2026)
 #
 #  PHP2Shell (CVE-2026-109618 / CVE-2026-109619)
 #  Verwundbarkeits- und Kompromittierungs-Check für Laravel-Forge-Server
@@ -18,19 +18,19 @@
 #           REPORT=/pfad.log    Report-Datei (Default: /root/php2shell-audit-<host>-<ts>.log)
 #  Exit:    0 unauffällig · 1 Versuche/Prüfpunkte · 2 kritisch/verwundbar · 3 Fehler
 # =============================================================================
- 
+
 if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
   echo "Bash >= 4 erforderlich" >&2; exit 3
 fi
 if [ "$(id -u)" -ne 0 ]; then
   echo "Bitte als root ausführen: sudo bash $0" >&2; exit 3
 fi
- 
+
 export LC_ALL=C GIT_TERMINAL_PROMPT=0
 umask 077
 renice -n 15 -p $$ >/dev/null 2>&1
 ionice -c3 -p $$ >/dev/null 2>&1
- 
+
 SINCE_IN="${SINCE:-2026-08-01}"
 SINCE_EPOCH=$(date -d "$SINCE_IN" +%s 2>/dev/null) || { echo "Ungültiges SINCE: $SINCE_IN" >&2; exit 3; }
 SINCE=$(date -d "@$SINCE_EPOCH" +%F)
@@ -41,14 +41,14 @@ REPORT="${REPORT:-/root/php2shell-audit-$(hostname -s)-$(date +%Y%m%d-%H%M%S).lo
 TMPD="$(mktemp -d /root/.p2s-audit.XXXXXX)" || exit 3
 trap 'rm -rf "$TMPD"' EXIT
 TMPREF="$TMPD/ref"
- 
+
 if [ -t 1 ]; then
   R=$'\e[1;31m'; Y=$'\e[1;33m'; G=$'\e[1;32m'; B=$'\e[1;34m'; C=$'\e[1;36m'; N=$'\e[0m'
 else
   R=""; Y=""; G=""; B=""; C=""; N=""
 fi
 exec > >(tee >(sed -u 's/\x1b\[[0-9;]*m//g' > "$REPORT")) 2>&1
- 
+
 # ----------------------------------------------------------------------------
 #  IoCs & Referenzwerte (Quellen: PHP-Advisories, ELLIO, AWS/MadPot, Sophos, Splunk)
 # ----------------------------------------------------------------------------
@@ -69,27 +69,27 @@ IOC_FILES_ALT='shell\.php|shell\.phtml|shell\.php5|shell\.php\.jpg|1\.aspx|bot\.
 IOC_FILES_RE="^(${IOC_FILES_ALT})$"
 IOC_PROCNAMES='telnetd|udhcpc|upnpd|watchdog|syslogd|klogd|uhttpd|uchttpd'
 IOC_SESSIDS='attacksessionid|leaksessionid|nuclei'
- 
+
 join_re() { local IFS='|'; local s="$*"; echo "${s//./\\.}"; }
 SRC_IP_RE=$(join_re "${IOC_SRC_IPS[@]}")
 C2_IP_RE=$(join_re "${IOC_C2_IPS[@]}")
- 
+
 # Webshell-Muster (PCRE) + IoC-Strings
 WS_CORE='\b(eval|assert|system|exec|shell_exec|passthru|popen|proc_open|pcntl_exec|create_function)\s*\(\s*@?\s*(base64_decode|gzinflate|gzuncompress|gzdecode|str_rot13|hex2bin|\$_(GET|POST|REQUEST|COOKIE|FILES))|\$_(GET|POST|REQUEST|COOKIE)\s*\[[^\]]{0,40}\]\s*\(|`\s*\$_(GET|POST|REQUEST|COOKIE)'
 SCAN_RE="(?i)(${WS_CORE})|${IOC_STRINGS}"
 GREP_PHP_INC=(--include='*.php' --include='*.phtml' --include='*.phar' --include='*.php[0-9]' --include='*.pht' --include='*.phps' --include='*.inc')
 FIND_PHPISH=( \( -iname '*.php' -o -iname '*.phtml' -o -iname '*.phar' -o -iname '*.php[0-9]' -o -iname '*.pht' -o -iname '*.phps' \) )
- 
+
 # Log-Marker
 PARSER_RE='Input variables exceeded|Input variable nesting level exceeded|Multipart body parts limit exceeded|Maximum number of allowable file uploads|Allowed memory size of [0-9]+ bytes exhausted.*in Unknown on line 0|session id is too long or contains illegal characters|Missing boundary in multipart'
 OOM_RE='Allowed memory size of [0-9]+ bytes exhausted'
 CRASH_RE='upstream prematurely closed|recv\(\) failed \(104'
 BODY_RE='client intended to send too large body'
- 
+
 # PHP-Aufrufe als root: niemals auto_prepend/auto_append ausführen
 PHPSAFE=(-n -d display_errors=0)
 PHPINI=(-d auto_prepend_file= -d auto_append_file= -d display_errors=0)
- 
+
 # ----------------------------------------------------------------------------
 #  Ausgabe / Befunde
 # ----------------------------------------------------------------------------
@@ -113,14 +113,14 @@ is_elf() { [ "$(head -c4 -- "$1" 2>/dev/null | od -An -tx1 | tr -d ' \n')" = "7f
 sha() { sha256sum -- "$1" 2>/dev/null | awk '{print $1}'; }
 pkg_owner() { local f=$1 o r
   for o in "$f" "${f#/usr}" "/usr$f"; do
-    r=$(dpkg -S "$o" 2>/dev/null | grep -v '^diversion' | head -1 | cut -d: -f1); [ -n "$r" ] && { echo "$r"; return 0; }
+    r=$(dpkg -S "${o//\\/\\\\}" 2>/dev/null | grep -v '^diversion' | head -1 | cut -d: -f1); [ -n "$r" ] && { echo "$r"; return 0; }
   done; return 1; }
 pkg_clean() { # 0 = Datei gehört zu einem Paket und ist unverändert
   local f=$1 pkg; pkg=$(pkg_owner "$f") || return 1; [ -n "$pkg" ] || return 1
   ! dpkg --verify "$pkg" 2>/dev/null | grep -qE " (${f}|${f#/usr}|/usr${f})$"; }
 not_pkg_clean() { local f; while IFS= read -r f; do [ -n "$f" ] && ! pkg_clean "$f" && echo "$f"; done; }
 ioc_hash() { local h; h=$(sha "$1"); [ -n "$h" ] && [[ "$IOC_HASHES" == *" $h"* ]]; }
- 
+
 # Datum je Zeile extrahieren (nginx YYYY/MM/DD, ISO, [DD-Mon-YYYY, [DD/Mon/YYYY) → Zähler je Tag ≥ SINCE
 perday() {
   awk -v s="$SINCE" '
@@ -144,7 +144,7 @@ since_lines() {
     else if (b) { t=substr($0,rb,11); d=substr(t,8,4) "-" M[substr(t,4,3)] "-" substr(t,1,2) }
     if (d!="" && d>=s) print }'
 }
- 
+
 first_date() {   # ältester Eintrag der ältesten Logdatei
   local f; f=$(ls -1tr -- "$@" 2>/dev/null | head -1); [ -z "$f" ] && return
   zcat -f -- "$f" 2>/dev/null | head -n 20 | perday_any | head -1
@@ -169,7 +169,7 @@ expand_logs() { # Basis-Pfade → vorhandene Dateien inkl. Rotation
   done | sort -u
 }
 mark_logs() { local p; for p in "$@"; do [ -n "$p" ] && LOG_DONE[$p]=1; done; }
- 
+
 # ----------------------------------------------------------------------------
 #  Log-Analysen
 # ----------------------------------------------------------------------------
@@ -198,7 +198,20 @@ analyze_err() { # $1 Label, Rest: Dateien
   n=$(printf '%s\n' "$b" | perday | sumday)
   [ "$n" -gt 0 ] && { info "$label: $n zu große Request-Bodies abgewiesen – je Tag:"; printf '%s\n' "$b" | perday | det; }
 }
- 
+
+status_of() { awk -F'"' '{split($3,a," "); print a[1]}'; }
+hits_by_status() { # $1 Label $2 Text $3 Zeilen $4 lines|ips
+  [ -z "$3" ] && return
+  local reached; reached=$(printf '%s\n' "$3" | awk -F'"' '{split($3,a," "); if (a[1]!="444" && a[1]!="400" && a[1]!="413") print}')
+  local st; st=$(printf '%s\n' "$3" | status_of | sort | uniq -c | sort -rn | awk '{printf "%s×%s ", $1, $2}')
+  if [ -z "$reached" ]; then
+    info "$1: $(cnt "$3") $2 – alle von Nginx verworfen (Status: $st) → PHP nicht erreicht"
+  else
+    att "$1: $(cnt "$reached") von $(cnt "$3") $2 erreichten PHP (Status: $st)"
+    if [ "$4" = ips ]; then printf '%s\n' "$reached" | awk '{print $1}' | sort | uniq -c | sort -rn | det
+    else printf '%s\n' "$reached" | tail -n "$MAXLIST" | det; fi
+  fi
+}
 analyze_access() { # $1 Label, $2 laravel(0/1), Rest: Dateien
   local label=$1 lara=$2; shift 2
   [ $# -eq 0 ] && return
@@ -207,12 +220,10 @@ analyze_access() { # $1 Label, $2 laravel(0/1), Rest: Dateien
   local cand="$TMPD/acc"
   zcat -f -- "$@" 2>/dev/null | grep -aE "\" (500|502|413) |php2shell|php-session-startup-rce|\.ph(p[0-9]?|tml|ar)[ ?]|[?&]cmd=|^($SRC_IP_RE) " > "$cand"
   local x n
-  x=$(grep -aiE "$IOC_UA" "$cand")
-  if [ -n "$x" ]; then att "$label: $(cnt "$x") Requests mit PHP2Shell-Scanner-User-Agent"; printf '%s\n' "$x" | tail -n "$MAXLIST" | det
-  else ok "$label: keine bekannten PHP2Shell-User-Agents"; fi
-  x=$(grep -aE "^($SRC_IP_RE) " "$cand")
-  if [ -n "$x" ]; then att "$label: $(cnt "$x") Requests von veröffentlichten PHP2Shell-Angreifer-IPs"; printf '%s\n' "$x" | awk '{print $1}' | sort | uniq -c | sort -rn | det
-  else ok "$label: keine Requests von bekannten Angreifer-IPs"; fi
+  x=$(grep -aiE "$IOC_UA" "$cand"); hits_by_status "$label" "Requests mit PHP2Shell-Scanner-User-Agent" "$x" lines
+  [ -z "$x" ] && ok "$label: keine bekannten PHP2Shell-User-Agents"
+  x=$(grep -aE "^($SRC_IP_RE) " "$cand"); hits_by_status "$label" "Requests von veröffentlichten PHP2Shell-Angreifer-IPs" "$x" ips
+  [ -z "$x" ] && ok "$label: keine Requests von bekannten Angreifer-IPs"
   x=$(grep -aE '"POST [^"]*" 500 ' "$cand")
   n=$(printf '%s\n' "$x" | perday | sumday)
   if [ "$n" -gt 0 ]; then
@@ -231,24 +242,23 @@ analyze_access() { # $1 Label, $2 laravel(0/1), Rest: Dateien
   x=$(grep -aE '[?&]cmd=[^" ]*[^"]*" 200 ' "$cand")
   [ -n "$x" ] && { rev "$label: $(cnt "$x") Requests mit Parameter cmd= und Status 200"; printf '%s\n' "$x" | tail -n "$MAXLIST" | det; }
 }
- 
+
 # ----------------------------------------------------------------------------
 #  Datei-Heuristiken
 # ----------------------------------------------------------------------------
 # PHP-Dateien, deren ctime nach dem letzten Composer-Lauf (+Toleranz) liegt.
 # ctime lässt sich ohne root nicht fälschen (touch ändert nur mtime).
 ctime_check() { # $1 Verzeichnis  $2 mit_app(0/1)  $3 Label
-  local d=$1 withapp=$2 lbl=$3 al="$1/vendor/autoload.php"
-  if [ ! -f "$al" ]; then info "$lbl: kein vendor/autoload.php – Zeitstempel-Heuristik übersprungen"; return; fi
-  local a i ref
-  a=$(stat -c %Z "$al"); i=$(stat -c %Z "$d/vendor/composer/installed.php" 2>/dev/null || echo "$a")
-  if (( a - i > 120 || i - a > 120 )); then
-    rev "$lbl: vendor/autoload.php außerhalb eines Composer-Laufs geändert (Δ $((a - i)) s)"
-  fi
-  ref=$(( (a < i ? a : i) + TOL_MIN * 60 ))
+  local d=$1 withapp=$2 lbl=$3
+  if [ ! -d "$d/vendor/composer" ]; then info "$lbl: kein vendor/composer – Zeitstempel-Heuristik übersprungen"; return; fi
+  # Composer schreibt Dateien nur bei Änderung → jüngste ctime in vendor/composer = letzter wirksamer Composer-Lauf
+  local cref ref
+  cref=$(find "$d/vendor/composer" -maxdepth 1 -type f \( -name '*.php' -o -name '*.json' \) -printf '%C@\n' 2>/dev/null | sort -n | tail -1 | cut -d. -f1)
+  [ -z "$cref" ] && { info "$lbl: vendor/composer leer – Heuristik übersprungen"; return; }
+  ref=$(( cref + TOL_MIN * 60 ))
   touch -d "@$ref" "$TMPREF"
-  info "$lbl: letzter Composer-Lauf $(date -d "@$(( a < i ? a : i ))" '+%F %T') – Prüfung auf spätere Änderungen"
-  local v; v=$(find "$d/vendor" -xdev -type f "${FIND_PHPISH[@]}" ! -path "$al" ! -path "$d/vendor/composer/installed.php" -cnewer "$TMPREF" 2>/dev/null)
+  info "$lbl: letzter wirksamer Composer-Lauf $(date -d "@$cref" '+%F %T') – Prüfung auf spätere Änderungen"
+  local v; v=$(find "$d/vendor" -xdev -path "$d/vendor/composer" -prune -o -type f "${FIND_PHPISH[@]}" -cnewer "$TMPREF" -print 2>/dev/null)
   if [ -n "$v" ]; then
     if [ "$(cnt "$v")" -gt 200 ]; then rev "$lbl: $(cnt "$v") vendor-Dateien nach Composer-Lauf geändert (Massenänderung, z. B. chown/chmod?) – Stichprobe:"
     else rev "$lbl: $(cnt "$v") vendor-PHP-Dateien nach Composer-Lauf geändert:"; fi
@@ -264,7 +274,7 @@ ctime_check() { # $1 Verzeichnis  $2 mit_app(0/1)  $3 Label
     else ok "$lbl: App-Code unverändert seit Build"; fi
   fi
 }
- 
+
 # Muster-Scan; IoC-Treffer sind immer KRITISCH, sonst Level $1
 pattern_scan() { # $1 level(crit|rev)  $2 Label  Rest: Verzeichnisse
   local lvl=$1 lbl=$2; shift 2
@@ -282,7 +292,7 @@ pattern_scan() { # $1 level(crit|rev)  $2 Label  Rest: Verzeichnisse
       printf '%s  →  %s\n' "$f" "$(grep -aoiP -m1 "$SCAN_RE" -- "$f" | head -1 | cut -c1-80)"; done | det
   fi
 }
- 
+
 # Webroot / Storage / Uploads
 webroot_checks() { # $1 app  $2 pub  $3 stor  $4 laravel  $5 Label
   local app=$1 pub=$2 stor=$3 lara=$4 lbl=$5 x f c
@@ -308,7 +318,7 @@ webroot_checks() { # $1 app  $2 pub  $3 stor  $4 laravel  $5 Label
       else rev "$lbl: PHP-Dateien in storage/app/public:"; fi
       printf '%s\n' "$x" | det
     fi
-    x=$(find "$stor" -xdev \( -path "$stor/framework/views" -o -path "$stor/app/public" \) -prune -o -type f "${FIND_PHPISH[@]}" -print 2>/dev/null)
+    x=$(find "$stor" -xdev \( -path "$stor/framework/views" -o -path "$stor/app/public" \) -prune -o -type f "${FIND_PHPISH[@]}" ! -path "$stor/framework/cache/facade-*.php" -print 2>/dev/null)
     [ -n "$x" ] && { rev "$lbl: PHP-Dateien in storage/ (Upload-Versuch? nicht direkt per Web erreichbar):"; printf '%s\n' "$x" | det; }
     x=$(find "$stor/app" "$pub" -xdev -type f \( -iname '*.php.*' -o -iname '*.phtml.*' -o -iname '*.php[0-9].*' \) 2>/dev/null)
     [ -n "$x" ] && { att "$lbl: Uploads mit Doppel-Endung (z. B. shell.php.jpg):"; printf '%s\n' "$x" | det; }
@@ -327,14 +337,14 @@ webroot_checks() { # $1 app  $2 pub  $3 stor  $4 laravel  $5 Label
   x=$(find "$app" "$pub" "$stor" -xdev \( -name node_modules -o -name .git -o -name vendor \) -prune -o -type f -regextype posix-extended -regex ".*/(${IOC_FILES_ALT})" -print 2>/dev/null | sort -u)
   [ -n "$x" ] && { crit "$lbl: Dateinamen aus PHP2Shell-Kampagnen:"; printf '%s\n' "$x" | det; }
 }
- 
+
 # ============================================================================
 sect "PHP2Shell-Audit · $HOST · $(date '+%F %T %Z')"
 OSNAME=$(grep -s '^PRETTY_NAME=' /etc/os-release | cut -d= -f2- | tr -d '"')
 info "System: ${OSNAME:-?} · Kernel $(uname -r) · Boot: $(uptime -s 2>/dev/null)"
 info "Prüfzeitraum ab $SINCE · Report: $REPORT"
 info "Hinweis: rein lesend. Fehlende Treffer sind kein Beweis – Request-Bodies werden i. d. R. nicht geloggt."
- 
+
 # ============================================================================
 sect "1 · Verwundbarkeit (PHP-Versionen, laufende Prozesse, Mitigations)"
 CUR="PHP"
@@ -366,7 +376,7 @@ for v in "${PHPVERS[@]}"; do
   elif dpkg --compare-versions "$served" lt "$fixed"; then
     if [ -n "$fpm" ]; then vuln "PHP-FPM $fpm < $fixed"; else info "CLI $cli < $fixed (nicht über Web erreichbar, trotzdem patchen)"; fi
   else ok "Version $served ≥ $fixed (gepatcht)"; fi
- 
+
   # laufende FPM-Master: noch alte (gelöschte) Binary geladen?
   for pid in $(pgrep -f "php-fpm: master process \(/etc/php/$v/" 2>/dev/null); do
     exe=$(readlink "/proc/$pid/exe" 2>/dev/null)
@@ -375,13 +385,14 @@ for v in "${PHPVERS[@]}"; do
       vuln "FPM-Master PID $pid (Start: $started) nutzt noch die alte, gelöschte Binary – 'systemctl restart php$v-fpm' nötig"
     else ok "FPM-Master PID $pid läuft mit aktueller Binary (Start: $started)"; fi
   done
- 
+
   # Mitigations / ini (nur Info, da Patch maßgeblich)
   if [ -f "/etc/php/$v/fpm/php.ini" ] && [ -x "/usr/bin/php$v" ]; then
     iniget() { PHP_INI_SCAN_DIR="/etc/php/$v/fpm/conf.d" "/usr/bin/php$v" -c "/etc/php/$v/fpm/php.ini" "${PHPINI[@]}" \
                -r "\$x=ini_get('$1'); echo \$x===false?'n/a':(\$x===''?'leer':\$x);" 2>/dev/null; }
     upe=$(iniget session.upload_progress.enabled); ml=$(iniget memory_limit); feb=$(iniget fatal_error_backtraces)
     sp=$(iniget session.save_path); el=$(iniget error_log)
+    case "$upe" in leer|0) upe="0 (aus – Mitigation aktiv)";; 1) upe="1 (an)";; esac
     info "FPM-ini: session.upload_progress.enabled=${upe} · memory_limit=${ml} · fatal_error_backtraces=${feb}"
     [ -n "$sp" ] && [ "$sp" != leer ] && [ "$sp" != n/a ] && SESS_PATHS+=("${sp##*;}")
     [ -n "$el" ] && [ "$el" != leer ] && [ "$el" != n/a ] && [ "$el" != syslog ] && PHP_ERRLOGS+=("$el")
@@ -392,7 +403,7 @@ for v in "${PHPVERS[@]}"; do
   ov=$(grep -HsE '^\s*php_(admin_)?(value|flag)\[(session\.upload_progress\.enabled|memory_limit|fatal_error_backtraces)\]' /etc/php/$v/fpm/pool.d/*.conf 2>/dev/null)
   [ -n "$ov" ] && { info "Pool-Overrides:"; printf '%s\n' "$ov" | det; }
 done
- 
+
 # FrankenPHP (Octane) bringt eigenes PHP mit – nur als Owner ausführen
 FP_BINS=$( { for p in $(pgrep -x frankenphp 2>/dev/null); do readlink -f "/proc/$p/exe"; done
              find /home -xdev -maxdepth 4 -type f -name frankenphp -perm /111 2>/dev/null; } | sed 's/ (deleted)$//' | sort -u)
@@ -414,7 +425,7 @@ if command -v apache2ctl >/dev/null 2>&1 && pgrep -x apache2 >/dev/null 2>&1; th
   apache2ctl -M 2>/dev/null | grep -qi php && info "Apache mit mod_php aktiv (höchstes Risiko laut Advisory) – Version oben maßgeblich"
 fi
 if pgrep -x dockerd >/dev/null 2>&1; then info "Docker läuft – PHP in Containern wird von diesem Skript NICHT geprüft"; fi
- 
+
 # ============================================================================
 sect "2 · Sites"
 declare -A S_BASE=() S_ZDT=() S_WEBROOT=() S_PUB=() S_CONF=() S_PHP=() S_ALOG=() S_ELOG=() S_OWNER=()
@@ -469,7 +480,7 @@ for s in "${SITES[@]}"; do
   printf '        %-45s %s\n' "${S_BASE[$s]}" "$([ "${S_ZDT[$s]}" = 1 ] && echo "ZDT → ${s##*/}" || echo klassisch) · Owner ${S_OWNER[$s]} · ${S_PHP[$s]:-PHP ?}$([ "${S_CONF[$s]}" = - ] && echo ' · NICHT in Nginx aktiv')"
   [[ " $WEBUSERS " == *" ${S_OWNER[$s]} "* ]] || WEBUSERS+=" ${S_OWNER[$s]}"
 done
- 
+
 for app in "${SITES[@]}"; do
   base="${S_BASE[$app]}"; pub="${S_PUB[$app]}"; owner="${S_OWNER[$app]}"
   S_BASE_CUR="$base"
@@ -478,7 +489,7 @@ for app in "${SITES[@]}"; do
   lara=0; [ -f "$app/artisan" ] && lara=1
   stor=$(readlink -f -- "$app/storage" 2>/dev/null); [ -d "$stor" ] || stor=""
   info "aktiv: $app · public: $pub · storage: ${stor:-–} · Laravel: $([ $lara = 1 ] && echo ja || echo nein)"
- 
+
   # Zero-Downtime: Symlink + alle Releases
   RELS=()
   if [ "${S_ZDT[$app]}" = 1 ]; then
@@ -489,7 +500,7 @@ for app in "${SITES[@]}"; do
     mapfile -t RELS < <(find "$base/releases" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
     info "${#RELS[@]} Release(s) – alle werden geprüft (inaktive = Spurensicherung)"
   fi
- 
+
   # Code-Integrität aktive Version
   if [ -d "$app/.git" ]; then
     gown=$(stat -c %U -- "$app/.git")
@@ -507,10 +518,10 @@ for app in "${SITES[@]}"; do
   else
     ctime_check "$app" 1 "aktiv"
   fi
- 
+
   # Webroot/Storage/Uploads
   webroot_checks "$app" "$pub" "$stor" "$lara" "aktiv"
- 
+
   # Muster-Scans
   pattern_scan crit "Webroot"          "$pub"
   [ -n "$stor" ] && pattern_scan crit "storage" "$stor"
@@ -518,7 +529,7 @@ for app in "${SITES[@]}"; do
   appdirs=(); for d in "$app"/*/; do d="${d%/}"; case "${d##*/}" in vendor|node_modules|storage|public|bootstrap) ;; *) appdirs+=("$d");; esac; done
   pattern_scan rev "App-Code" "${appdirs[@]}"
   [ -d "$app/vendor" ] && pattern_scan rev "vendor" "$app/vendor"
- 
+
   # Inaktive Releases
   for rel in "${RELS[@]}"; do
     [ "$rel" = "$app" ] && continue
@@ -531,17 +542,18 @@ for app in "${SITES[@]}"; do
     pattern_scan rev "$rn" "${rdirs[@]}"
     QUIET=0
   done
- 
+
   # .env
   if [ -f "$base/.env" ] || [ -f "$app/.env" ]; then
     ef=$(readlink -f -- "$app/.env" 2>/dev/null || echo "$base/.env")
     info ".env zuletzt geändert: $(date -d "@$(stat -c %Y -- "$ef" 2>/dev/null || echo 0)" +%F) – Secrets rotieren, falls Server im Zeitraum verwundbar war (Memory-Disclosure)"
   fi
- 
+
   # Logs der Site
   al=(); for a in ${S_ALOG[$app]:-}; do [ "$a" = off ] && continue; al+=("$a"); done
   if [ -n "${S_ALOG[$app]:-}" ] && [ ${#al[@]} -eq 0 ]; then
     info "Access-Log in Nginx deaktiviert (access_log off) – HTTP-Indizien für diese Site nicht prüfbar"
+    L_COV+=("[$CUR] Access-Log deaktiviert – Site-Traffic nicht prüfbar (globales access.log enthält nur den Catch-All)")
   fi
   if [ -z "${S_ALOG[$app]:-}" ] && [ "${S_CONF[$app]}" != - ]; then info "kein eigenes Access-Log – ggf. im globalen access.log (Abschnitt 3)"; fi
   if [ ${#al[@]} -gt 0 ]; then mark_logs "${al[@]}"; mapfile -t lf < <(expand_logs "${al[@]}"); analyze_access "Access-Log" "$lara" "${lf[@]}"; fi
@@ -549,7 +561,7 @@ for app in "${SITES[@]}"; do
   if [ ${#el[@]} -gt 0 ]; then mark_logs "${el[@]}"; mapfile -t lf < <(expand_logs "${el[@]}"); analyze_err "Error-Log" "${lf[@]}"; fi
 done
 CUR=""
- 
+
 # ============================================================================
 sect "3 · Globale Logs"
 CUR="Logs"
@@ -562,7 +574,7 @@ done
 for e in $(printf '%s\n' "${PHP_ERRLOGS[@]}" | sort -u); do
   mapfile -t lf < <(expand_logs "$e"); [ ${#lf[@]} -gt 0 ] && analyze_err "PHP error_log $e" "${lf[@]}"
 done
- 
+
 sub "PHP-FPM-Logs (Worker-Abstürze)"
 mapfile -t fl < <(ls -1 /var/log/php*-fpm.log* 2>/dev/null)
 if [ ${#fl[@]} -gt 0 ]; then
@@ -575,7 +587,7 @@ if [ ${#fl[@]} -gt 0 ]; then
   n=$(printf '%s\n' "$x" | perday | sumday)
   [ "$n" -gt 0 ] && { info "$n Worker-Kills (SIGKILL) / max_children-Warnungen – je Tag:"; printf '%s\n' "$x" | perday | det; }
 else info "keine PHP-FPM-Logdateien gefunden"; fi
- 
+
 sub "Kernel (Segfaults / OOM-Killer)"
 KRE='php[^ ]*\[[0-9]+\]: segfault|segfault at .*php|Killed process [0-9]+ \((php|frankenphp)'
 k=$(journalctl _TRANSPORT=kernel -q --no-pager -o short-iso --since "$SINCE" 2>/dev/null | grep -aE "$KRE")
@@ -585,7 +597,7 @@ if [ "$n" -gt 0 ]; then att "$n PHP-Segfaults im Kernel-Log – je Tag:"; printf
 else ok "keine PHP-Segfaults im Kernel-Log"; fi
 n=$(printf '%s\n' "$k" | grep -a 'Killed process' | perday | sumday)
 [ "$n" -gt 0 ] && info "$n PHP-Prozesse vom OOM-Killer beendet"
- 
+
 ms=$(ls -1 /var/log/modsec_audit.log* /var/log/apache2/modsec_audit.log* /var/log/nginx/modsec_audit.log* 2>/dev/null)
 if [ -n "$ms" ]; then
   sub "ModSecurity-Audit-Log (Request-Bodies)"
@@ -594,7 +606,7 @@ if [ -n "$ms" ]; then
 else
   info "Kein WAF/ModSecurity-Body-Log – Kernmerkmal (Feld PHP_SESSION_UPLOAD_PROGRESS im Body) nicht prüfbar"
 fi
- 
+
 # ============================================================================
 sect "4 · Native PHP-Sessions (Upload-Progress-Pfad)"
 CUR="Sessions"
@@ -610,7 +622,7 @@ for sd in $(printf '%s\n' "${SESS_PATHS[@]}" | sort -u); do
   x=$(printf '%s\n' "${sf[@]}" | xargs -r grep -laE "upload_progress_|$IOC_STRINGS|pwn" 2>/dev/null)
   [ -n "$x" ] && { att "Session-Dateien mit Upload-Progress-Daten/Exploit-Canaries:"; printf '%s\n' "$x" | det; }
 done
- 
+
 # ============================================================================
 sect "5 · Prozesse & Netzwerk"
 CUR="Prozesse"
@@ -628,7 +640,7 @@ if [ -n "$desc" ]; then
     else rev "Kindprozess eines PHP-Workers: $line"; fi
   done <<< "$desc"
 else ok "keine Kindprozesse von PHP-FPM-Workern"; fi
- 
+
 pc=""; pr=""; pn=""; pw=""
 for p in /proc/[0-9]*; do
   pid=${p##*/}
@@ -657,7 +669,7 @@ done
 [ -n "$pw" ] && { rev "Prozesse von Web-Usern mit Binary außerhalb der System-Pfade:"; printf '%s' "$pw" | det; }
 [ -z "$pc$pn$pw" ] && ok "keine verdächtigen Prozess-Binaries"
 [ -n "$pr" ] && { info "Prozesse mit aktualisierter Binary (Neustart empfohlen):"; printf '%s' "$pr" | sort | uniq -c | det; }
- 
+
 CUR="Netzwerk"
 if command -v ss >/dev/null 2>&1; then
   est=$(ss -Htanp state established 2>/dev/null)
@@ -668,22 +680,23 @@ if command -v ss >/dev/null 2>&1; then
   x=$(printf '%s\n' "$est" | grep -aE 'users:\(\("(sh|bash|dash|nc|ncat|netcat|socat|perl|python[0-9.]*|ruby|busybox|telnet)"')
   [ -n "$x" ] && { crit "Netzwerkverbindungen von Shells/Interpretern (Reverse Shell?):"; printf '%s\n' "$x" | det; }
   lst=$(ss -Htlnup 2>/dev/null | awk '$5 !~ /^(127\.|\[::1\]|::1|\[::ffff:127\.)/' \
-        | grep -avE 'users:\(\("(nginx|sshd|systemd|mysqld|mariadbd|postgres|redis-server|redis-check|memcached|php-fpm[0-9.]*|php[0-9.]*|systemd-resolve|chronyd|ntpd|master|exim4|node|meilisearch|frankenphp|rr|supervisord|beanstalkd|docker-proxy|soketi|typesense-serve|minio)"')
+        | grep -avE 'users:\(\("(nginx|sshd|systemd|systemd-network|dhclient|mysqld|mariadbd|postgres|redis-server|redis-check|memcached|php-fpm[0-9.]*|php[0-9.]*|systemd-resolve|chronyd|ntpd|master|exim4|node|meilisearch|frankenphp|rr|supervisord|beanstalkd|docker-proxy|soketi|typesense-serve|minio)"')
   [ -n "$lst" ] && { rev "Öffentliche Listener unbekannter Prozesse:"; printf '%s\n' "$lst" | det; }
   dns=$(ss -Hunp state established 2>/dev/null | awk '$4 ~ /:53$/ && $4 !~ /^(127\.|\[::1\])/' | grep -avE 'systemd-resolve|named|unbound|dnsmasq')
   [ -n "$dns" ] && { rev "Direkte DNS-Abfragen an externe Resolver (Malware nutzt fest kodierte Resolver):"; printf '%s\n' "$dns" | det; }
   [ -z "$(printf '%s\n' "$est" | grep -aE "($C2_IP_RE)[]:]")" ] && ok "keine Verbindungen zu bekannter C2-Infrastruktur"
 else info "ss nicht verfügbar – Netzwerkprüfung übersprungen"; fi
- 
+
 # ============================================================================
 sect "6 · Persistenz, Systemintegrität, Temp-Verzeichnisse"
 CUR="System"
 if [ -s /etc/ld.so.preload ]; then crit "/etc/ld.so.preload ist gesetzt (Rootkit-Technik):"; det < /etc/ld.so.preload; else ok "/etc/ld.so.preload leer/nicht vorhanden"; fi
 x=$(awk -F: '$3==0 && $1!="root"{print $1}' /etc/passwd)
 [ -n "$x" ] && { crit "weitere Accounts mit UID 0:"; printf '%s\n' "$x" | det; }
-x=$(find /etc/passwd /etc/shadow /etc/group /etc/sudoers /etc/sudoers.d -newerct "$SINCE" 2>/dev/null)
+x=$(find /etc/passwd /etc/shadow /etc/group /etc/gshadow /etc/sudoers /etc/sudoers.d -type f -newerct "$SINCE" 2>/dev/null | not_pkg_clean \
+    | while IFS= read -r f; do echo "$f (geändert $(date -d "@$(stat -c %Z -- "$f")" '+%F %T'))"; done)
 [ -n "$x" ] && { rev "Account-/sudo-Dateien seit $SINCE geändert (Forge legt z. B. isolierte User an):"; printf '%s\n' "$x" | det; }
- 
+
 x=""
 for f in /root/.ssh/authorized_keys* /home/*/.ssh/authorized_keys*; do
   [ -f "$f" ] || continue
@@ -691,40 +704,45 @@ for f in /root/.ssh/authorized_keys* /home/*/.ssh/authorized_keys*; do
   in_since "$c" && x+="$f (geändert $(date -d "@$c" +%F), $(grep -cvE '^\s*(#|$)' "$f") Keys: $(awk '!/^\s*#/ && NF{print $NF}' "$f" | tr '\n' ' '))"$'\n'
 done
 [ -n "$x" ] && { rev "authorized_keys seit $SINCE geändert:"; printf '%s' "$x" | det; } || ok "authorized_keys seit $SINCE unverändert"
- 
+
 CRONF=(/etc/crontab /etc/anacrontab /etc/cron.d/* /etc/cron.hourly/* /etc/cron.daily/* /etc/cron.weekly/* /etc/cron.monthly/* /var/spool/cron/crontabs/*)
 x=$(find "${CRONF[@]}" -maxdepth 0 -type f -newerct "$SINCE" 2>/dev/null | not_pkg_clean)
 [ -n "$x" ] && { rev "Cron-Dateien seit $SINCE geändert:"; printf '%s\n' "$x" | det; }
 x=$(grep -HnaE '(curl|wget)[^|;#]*\|\s*(ba|z|da)?sh|base64\s+(-d|--decode)|/(tmp|dev/shm|var/tmp)/|bash\s+-i|\bnc(at)?\b.*\s-e\s|python[0-9.]*\s+-c|perl\s+-e|/storage/[^ ]*\.(sh|bin|elf)' "${CRONF[@]}" 2>/dev/null | grep -avE ':[0-9]+:\s*#')
 [ -n "$x" ] && { crit "verdächtige Cron-Einträge:"; printf '%s\n' "$x" | det; } || ok "keine verdächtigen Cron-Einträge"
 ls /var/spool/cron/atjobs/* >/dev/null 2>&1 && rev "at-Jobs vorhanden: $(ls /var/spool/cron/atjobs | tr '\n' ' ')"
- 
-x=$(find /etc/systemd/system /root/.config/systemd /home/*/.config/systemd -type f -newerct "$SINCE" 2>/dev/null)
-x+=$(find /lib/systemd/system /usr/lib/systemd/system -type f -newerct "$SINCE" -print0 2>/dev/null | xargs -0 -r readlink -f | sort -u | while IFS= read -r f; do pkg_owner "$f" >/dev/null || echo "$f (keinem Paket zugeordnet)"; done)
+
+x=$(find /etc/systemd/system /root/.config/systemd /home/*/.config/systemd -type f -newerct "$SINCE" ! -name 'snap-*.mount' ! -name 'snap.*' 2>/dev/null)
+x+=$'\n'$(find /lib/systemd/system /usr/lib/systemd/system -type f -newerct "$SINCE" -print0 2>/dev/null | xargs -0 -r readlink -f | sort -u | while IFS= read -r f; do pkg_owner "$f" >/dev/null || echo "$f (keinem Paket zugeordnet)"; done)
+x=$(printf '%s\n' "$x" | grep -v '^$')
 [ -n "$x" ] && { rev "systemd-Units seit $SINCE neu/geändert:"; printf '%s\n' "$x" | det; }
 x=$(grep -rlaE '^\s*Exec(Start|StartPre|StartPost|Reload)\s*=.*(/tmp/|/dev/shm/|/var/tmp/|/storage/)' /etc/systemd /lib/systemd/system /home/*/.config/systemd /root/.config/systemd 2>/dev/null)
 [ -n "$x" ] && { crit "systemd-Units starten Programme aus Temp-/Storage-Verzeichnissen:"; printf '%s\n' "$x" | det; }
 x=$(find /etc/supervisor -type f -newerct "$SINCE" 2>/dev/null)
 [ -n "$x" ] && { info "Supervisor-Configs geändert (Forge-Daemons/Queues – abgleichen):"; printf '%s\n' "$x" | det; }
- 
+
 RCF=(/etc/profile /etc/bash.bashrc /etc/environment /etc/profile.d/* /root/.bashrc /root/.profile /root/.bash_profile /home/*/.bashrc /home/*/.profile /home/*/.bash_profile /home/*/.bash_login /home/*/.zshrc)
 x=$(find "${RCF[@]}" -maxdepth 0 -type f -newerct "$SINCE" 2>/dev/null | not_pkg_clean)
 [ -n "$x" ] && { rev "Shell-Startdateien seit $SINCE geändert:"; printf '%s\n' "$x" | det; }
 x=$(grep -HnaE 'LD_PRELOAD|(curl|wget)[^|]*\|\s*(ba)?sh|/dev/(tcp|udp)/|base64\s+(-d|--decode)|/(tmp|dev/shm)/[^ ]*\s*&' "${RCF[@]}" 2>/dev/null)
 [ -n "$x" ] && { crit "verdächtige Einträge in Shell-Startdateien:"; printf '%s\n' "$x" | det; }
- 
+
 x=$(find /etc/php/*/fpm/php.ini /etc/php/*/fpm/pool.d /etc/php/*/fpm/conf.d /etc/php/*/cli/php.ini -type f -newerct "$SINCE" 2>/dev/null)
 [ -n "$x" ] && { info "PHP-Konfiguration seit $SINCE geändert (Forge-Panel/Updates – abgleichen):"; printf '%s\n' "$x" | det; }
 x=$(find /etc/nginx -type f -newerct "$SINCE" 2>/dev/null)
 [ -n "$x" ] && { info "Nginx-Konfiguration seit $SINCE geändert:"; printf '%s\n' "$x" | det; }
- 
+
 sub "Paket-Integrität (dpkg --verify)"
 pk=$(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 'php*' 'nginx*' openssh-server sudo coreutils procps iproute2 util-linux login passwd bash cron findutils grep 2>/dev/null | awk '$1=="ii"{print $2}')
 if [ -n "$pk" ]; then
-  x=$(dpkg --verify $pk 2>/dev/null | awk '$2!="c" && $1 ~ /^..5/')
-  [ -n "$x" ] && { crit "System-Binaries weichen vom Paket ab (Manipulation?):"; printf '%s\n' "$x" | det; } || ok "Binaries von PHP, Nginx, SSH, sudo, coreutils u. a. unverändert"
+  x=$(dpkg --verify $pk 2>/dev/null | awk '$2!="c" && $1 ~ /^..5/ {print $NF}')
+  xb=$(printf '%s\n' "$x" | grep -E '^/(usr/)?(s?bin|lib(64)?|libexec)/|\.so(\.[0-9.]+)?$' | grep -vE '\.(conf|cnf|ini|rules|service|timer|socket|txt)$')
+  xo=$(printf '%s\n' "$x" | grep -v '^$' | grep -vxF -f <(printf '%s\n' "$xb"))
+  [ -n "$xb" ] && { crit "System-Binaries/Libraries weichen vom Paket ab (Manipulation?):"; printf '%s\n' "$xb" | det; }
+  [ -n "$xo" ] && { rev "Paket-Konfigurationsdateien lokal angepasst (kein Binary):"; printf '%s\n' "$xo" | det; }
+  [ -z "$xb" ] && ok "Binaries/Libraries von PHP, Nginx, SSH, sudo, coreutils u. a. unverändert"
 fi
- 
+
 sub "Temp-Verzeichnisse (/tmp, /var/tmp, /dev/shm)"
 te=""; tk=""; tr_=""; tl=""
 while IFS=$'\t' read -r f u s m; do
@@ -749,7 +767,7 @@ if [ -n "$tl" ]; then
   [ -n "$x" ] && { att "…davon mit Exploit-Inhalten:"; printf '%s\n' "$x" | det; }
 fi
 [ -z "$tk$te$tr_$tl" ] && ok "Temp-Verzeichnisse unauffällig"
- 
+
 sub "Neue ELF-Binaries in /home seit $SINCE"
 x=$(find /home -xdev \( -name node_modules -o -name .git -o -name vendor -o -name .npm -o -name .nvm -o -name .cache -o -name .composer -o -name .bun -o -name .volta \) -prune \
       -o -type f -perm /111 -newerct "$SINCE" -size -60M -print 2>/dev/null | while IFS= read -r f; do is_elf "$f" && echo "$f"; done)
@@ -758,19 +776,21 @@ if [ -n "$x" ]; then
   [ -n "$h" ] && { crit "Bekannte PHP2Shell-Malware (SHA-256-Treffer):"; printf '%s\n' "$h" | det; }
   rev "Neue/geänderte ELF-Binaries unter /home (z. B. FrankenPHP/RoadRunner legitim):"; printf '%s\n' "$x" | det
 else ok "keine neuen ELF-Binaries unter /home"; fi
- 
+
 # ============================================================================
 sect "7 · SSH-Logins"
 CUR="SSH"
 if ls /var/log/auth.log* >/dev/null 2>&1; then src=$(zcat -f /var/log/auth.log* 2>/dev/null); lbl="auth.log"
 else src=$(journalctl -q --no-pager --since "$SINCE" -t sshd -t sshd-session 2>/dev/null); lbl="journal"; fi
-lg=$(printf '%s\n' "$src" | grep -aoE 'Accepted [a-z-]+ for [^ ]+ from [0-9a-fA-F:.]+' | sed 's/Accepted //' | sort | uniq -c | sort -rn)
+FORGE_IPS=" 159.203.150.232 159.203.150.216 45.55.124.124 165.227.248.218 "
+lg=$(printf '%s\n' "$src" | grep -aoE 'Accepted [a-z-]+ for [^ ]+ from [0-9a-fA-F:.]+' | sed 's/Accepted //' | sort | uniq -c | sort -rn \
+     | awk -v f="$FORGE_IPS" '{ip=$NF; t=""; if (index(f," " ip " ")) t="  (Laravel Forge)"; else if (ip ~ /^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)/) t="  (privates Netz)"; print $0 t}')
 if [ -n "$lg" ]; then
   info "Erfolgreiche Logins ($lbl, verfügbarer Zeitraum) – mit Firewall-Whitelist abgleichen:"; printf '%s\n' "$lg" | det
   pw=$(printf '%s\n' "$lg" | grep -aE ' (password|keyboard-interactive) ')
   [ -n "$pw" ] && { rev "Passwort-Logins (Forge deaktiviert Passwort-Auth normalerweise):"; printf '%s\n' "$pw" | det; }
 else info "keine SSH-Logins in $lbl gefunden"; fi
- 
+
 # ============================================================================
 CUR=""
 sect "ZUSAMMENFASSUNG · $HOST"
@@ -784,7 +804,7 @@ if [ ${#L_CRIT[@]} -gt 0 ]; then printf '\n  %sKRITISCH%s\n' "$R" "$N";   printf
 if [ ${#L_ATT[@]} -gt 0 ];  then printf '\n  %sVERSUCHE%s\n' "$Y" "$N";   printf '   - %s\n' "${L_ATT[@]}"; fi
 if [ ${#L_REV[@]} -gt 0 ];  then printf '\n  %sPRÜFEN%s\n' "$Y" "$N";     printf '   - %s\n' "${L_REV[@]}"; fi
 if [ ${#L_COV[@]} -gt 0 ];  then printf '\n  %sLOG-ABDECKUNG (Aussagekraft eingeschränkt)%s\n' "$B" "$N"; printf '   - %s\n' "${L_COV[@]}"; fi
- 
+
 printf '\n  %sURTEIL:%s ' "$C" "$N"
 if [ ${#L_CRIT[@]} -gt 0 ]; then
   echo "${R}Kompromittierung möglich.${N} Server vom Netz nehmen, Logs/Report sichern, Befunde forensisch prüfen; im Zweifel neu aufsetzen und ALLE Secrets rotieren."
@@ -798,7 +818,7 @@ else
   echo "${G}Keine Indizien gefunden.${N} (Begrenzt durch Log-Abdeckung; Secret-Rotation bleibt empfehlenswert, falls vor dem Patch exponiert.)"
 fi
 printf '  Report: %s\n\n' "$REPORT"
- 
+
 rc=0
 [ ${#L_ATT[@]} -gt 0 ] || [ ${#L_REV[@]} -gt 0 ] && rc=1
 [ ${#L_CRIT[@]} -gt 0 ] || [ ${#L_VULN[@]} -gt 0 ] && rc=2
