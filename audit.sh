@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  php2shell-audit.sh  ·  v1.3 (IoC-Stand 23.10.2026)
+#  php2shell-audit.sh  ·  v1.4 (IoC-Stand 23.10.2026)
 #
 #  PHP2Shell (CVE-2026-109618 / CVE-2026-109619)
 #  Verwundbarkeits- und Kompromittierungs-Check für Laravel-Forge-Server
@@ -419,7 +419,14 @@ for v in "${PHPVERS[@]}"; do
     info "FPM-ini: session.upload_progress.enabled=${upe} · memory_limit=${ml} · fatal_error_backtraces=${feb}"
     if [ "$isvuln" = 1 ]; then
       gaps=""
-      [ "$ml" != "-1" ] && gaps+="CVE-2026-109618 offen (memory_limit≠-1) · "
+      # effektives memory_limit je Pool (php_admin_value erzwingt, sonst php.ini/conf.d)
+      mlbad=""
+      for pf in /etc/php/$v/fpm/pool.d/*.conf; do
+        [ -f "$pf" ] || continue
+        pv=$(grep -hE '^\s*php_admin_value\[memory_limit\]' "$pf" | tail -1 | sed -E 's/^[^=]*=\s*//; s/\s*;.*$//; s/\s+$//')
+        [ "${pv:-$ml}" = "-1" ] || mlbad+="$(basename "$pf" .conf)=${pv:-$ml} "
+      done
+      [ -n "$mlbad" ] && gaps+="CVE-2026-109618 offen (memory_limit≠-1: ${mlbad% }) · "
       [[ "$upe" == 1* ]] && gaps+="CVE-2026-109619 offen (upload_progress an) · "
       [ "$v" = 8.5 ] && [ "$feb" = 1 ] && gaps+="CVE-2026-109619 (8.5-Backtrace-Pfad) offen (fatal_error_backtraces=1) · "
       [ -n "$gaps" ] && vuln "Mitigation unvollständig: ${gaps% · }"
